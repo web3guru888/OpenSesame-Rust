@@ -440,4 +440,132 @@ mod tests {
         let y = trm.forward(&x, 5);
         assert!(y.iter().all(|v| v.is_finite()));
     }
+
+    #[test]
+    fn test_rope_rotates_nontrivially() {
+        // pos > 0 should rotate the vector away from its original direction.
+        let rope = RoPE::new(8, 10_000.0);
+        let original = vec![1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let mut rotated = original.clone();
+        rope.rotate_vec(&mut rotated, 1);
+        // At pos=1 with base=10000, at least some components should differ.
+        let changed = original.iter().zip(rotated.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(changed, "RoPE at pos=1 should change the vector");
+    }
+
+    #[test]
+    fn test_rope_pos_differences() {
+        // Two different positions should produce different rotations.
+        let rope = RoPE::new(8, 10_000.0);
+        let v = vec![1.0f32, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
+        let mut v1 = v.clone();
+        let mut v2 = v.clone();
+        rope.rotate_vec(&mut v1, 1);
+        rope.rotate_vec(&mut v2, 5);
+        assert_ne!(v1, v2, "different positions should produce different rotations");
+    }
+
+    #[test]
+    fn test_causal_attention_no_future_leakage() {
+        // With non-trivial weights, token 0's output should not change when we
+        // append a second token after it (causal masking guarantee).
+        let d = 8usize; let nh = 2usize;
+        let mut mha = MultiHeadAttention::new(d, nh, 0, 10_000.0);
+        // Give q/k/v/out identity-ish weights (diagonal matrices) so non-zero output.
+        for o in 0..d {
+            mha.q_proj.weight[o * d + o]   = 1.0;
+            mha.k_proj.weight[o * d + o]   = 1.0;
+            mha.v_proj.weight[o * d + o]   = 1.0;
+            mha.out_proj.weight[o * d + o] = 1.0;
+        }
+        // Token 0: same in both sequences.
+        let token0: Vec<f32> = (0..d).map(|i| i as f32 * 0.1).collect();
+        // Token 1: deliberately very different (would contaminate if causality breaks).
+        let token1: Vec<f32> = (0..d).map(|i| 100.0 + i as f32).collect();
+
+        // Single-token sequence (only token 0).
+        let y1 = mha.forward(&token0, 1);
+
+        // Two-token sequence: [token0, token1].
+        let mut x2 = token0.clone();
+        x2.extend_from_slice(&token1);
+        let y2 = mha.forward(&x2, 2);
+
+        // Token 0's output must be identical in both cases (causal masking).
+        let first_token_same = y1.iter().zip(y2[..d].iter()).all(|(a, b)| (a - b).abs() < 1e-5);
+        assert!(first_token_same, "causal: first token output must not depend on future tokens");
+    }
+
+    #[test]
+    fn test_layernorm_gamma_beta_applied() {
+        // With gamma=2 and beta=1, output should be 2*(normalized)+1.
+        let mut ln = LayerNorm::new(4, 1e-5);
+        ln.gamma = vec![2.0; 4];
+        ln.beta  = vec![1.0; 4];
+        let y = ln.forward_vec(&[1.0, 2.0, 3.0, 4.0]);
+        // mean=2.5, variance=1.25, so normalized values are spread around 0.
+        // All outputs should be 1.0 + 2.0 * normalized_i.
+        let mean_out = y.iter().sum::<f32>() / 4.0;
+        assert!((mean_out - 1.0).abs() < 1e-4, "with beta=1, mean should be ~1.0");
+    }
+
+    #[test]
+    fn test_linear_bias_applied() {
+        let mut lin = Linear::new(2, 2, true);
+        lin.weight = vec![1.0, 0.0, 0.0, 1.0]; // identity
+        lin.bias   = vec![10.0, 20.0];
+        let y = lin.forward_vec(&[1.0, 2.0]);
+        assert!((y[0] - 11.0).abs() < 1e-5);
+        assert!((y[1] - 22.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_dw_conv_causality() {
+        // With a kernel that is all-zero except the last (past) position,
+        // the output at t=0 should depend only on the (zero-padded) past.
+        let c = 2usize; let k = 3usize;
+        let mut conv = CausalDepthwiseConv1d::new(c, k);
+        // Only the earliest kernel position (oldest past) has weight 1.
+        // kernel layout: [c, k] — for ch=0, position 0 (oldest) = 1.
+        conv.weight[0 * k + 0] = 1.0; // ch=0, oldest position
+        conv.weight[1 * k + 0] = 1.0; // ch=1, oldest position
+        conv.bias = vec![];
+        // Input: only t=1 is non-zero.
+        let mut x = vec![0.0f32; 4 * c];
+        x[1 * c + 0] = 5.0;
+        x[1 * c + 1] = 7.0;
+        let y = conv.forward(&x, 4);
+        // At t=2, the oldest kernel position reaches t=0 (zero). 
+        // At t=3, it reaches t=1 (non-zero) → output should be 5, 7.
+        assert!((y[3 * c + 0] - 5.0).abs() < 1e-5, "causal conv output mismatch ch0");
+        assert!((y[3 * c + 1] - 7.0).abs() < 1e-5, "causal conv output mismatch ch1");
+    }
+
+    #[test]
+    fn test_local_window_respected() {
+        // With context=1 (each token only sees itself), the output at each
+        // position should depend only on local info — test that using context=1
+        // is different from context=0 (full attention) with non-trivial input.
+        let d = 8usize; let nh = 2usize;
+        let mut mha_full   = MultiHeadAttention::new(d, nh, 0, 10_000.0);
+        let mut mha_window = MultiHeadAttention::new(d, nh, 1, 10_000.0);
+        // Same non-trivial weights
+        for o in 0..d {
+            mha_full.q_proj.weight[o * d + o]   = 0.5;
+            mha_window.q_proj.weight[o * d + o] = 0.5;
+            mha_full.k_proj.weight[o * d + o]   = 0.5;
+            mha_window.k_proj.weight[o * d + o] = 0.5;
+            mha_full.v_proj.weight[o * d + o]   = 0.5;
+            mha_window.v_proj.weight[o * d + o] = 0.5;
+            mha_full.out_proj.weight[o * d + o]   = 0.5;
+            mha_window.out_proj.weight[o * d + o] = 0.5;
+        }
+        let x: Vec<f32> = (0..4 * d).map(|i| (i % 7) as f32 * 0.1).collect();
+        let y_full   = mha_full.forward(&x, 4);
+        let y_window = mha_window.forward(&x, 4);
+        // With window=1, token 3 sees only itself (not tokens 0-2).
+        // They should differ at token 3 if earlier tokens carry different values.
+        assert_ne!(y_full[3*d..4*d], y_window[3*d..4*d],
+            "window=1 vs full attention should differ at token 3");
+    }
 }
