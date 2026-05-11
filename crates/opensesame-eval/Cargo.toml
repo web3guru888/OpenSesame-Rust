@@ -8,10 +8,5 @@ repository.workspace = true
 description = "Evaluation: PESQ, STOI, SI-SNR, WER, codec ABX — all implemented from scratch"
 
 [dependencies]
-atlas-core    = { path = "../atlas-core" }
-atlas-tensor  = { path = "../atlas-tensor" }
-atlas-tokenize = { path = "../atlas-tokenize" }
-opensesame-audio    = { path = "../opensesame-audio" }
-opensesame-mimi     = { path = "../opensesame-mimi" }
-opensesame-backbone = { path = "../opensesame-backbone" }
-opensesame-csm      = { path = "../opensesame-csm" }
+# Pure Rust implementation — no external crate dependencies beyond workspace path crates
+atlas-core   = { path = "../atlas-core" }
