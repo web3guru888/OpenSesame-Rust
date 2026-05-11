@@ -163,3 +163,117 @@ mod tests {
         assert_eq!(cfg.backbone.n_audio_codebooks, cfg.n_codebooks);
     }
 }
+
+// ── CsmConfig ─────────────────────────────────────────────────────────────────
+
+/// Flat configuration for the full CSM model (all fields explicit).
+///
+/// Unlike [`CsmModelConfig`] which nests sub-configs, `CsmConfig` exposes every
+/// hyper-parameter at the top level.  Useful for weight-loading and for
+/// constructing a model from a single JSON config file.
+///
+/// # Example
+/// ```
+/// # use opensesame_csm::CsmConfig;
+/// let cfg = CsmConfig::csm_1b();
+/// assert_eq!(cfg.audio_num_codebooks, 32);
+/// assert_eq!(cfg.frame_width, 33); // 32 audio + 1 text
+/// assert_eq!(cfg.audio_vocab_size, 2051);
+/// ```
+#[derive(Debug, Clone)]
+pub struct CsmConfig {
+    // ── Backbone (Llama 3.2 1B) ───────────────────────────────────────────────
+    /// Number of transformer layers. CSM-1B: 16.
+    pub backbone_n_layers:   usize,
+    /// Hidden dimension. CSM-1B: 2048.
+    pub backbone_d_model:    usize,
+    /// Query attention heads. CSM-1B: 32.
+    pub backbone_n_heads:    usize,
+    /// Key/value attention heads (GQA). CSM-1B: 8.
+    pub backbone_n_kv_heads: usize,
+    /// FFN intermediate dimension (SwiGLU). CSM-1B: 8192.
+    pub backbone_ffn_dim:    usize,
+    /// RoPE base frequency. CSM-1B: 500_000.0.
+    pub backbone_rope_base:  f32,
+    /// RoPE scale factor (YaRN). CSM-1B: 32.0.
+    pub backbone_rope_scale: f32,
+
+    // ── Depth decoder (Llama 3.2 100M) ───────────────────────────────────────
+    /// Number of depth-decoder layers. CSM-1B: 4.
+    pub decoder_n_layers:   usize,
+    /// Depth-decoder hidden dimension. CSM-1B: 1024.
+    pub decoder_d_model:    usize,
+    /// Depth-decoder query heads. CSM-1B: 8.
+    pub decoder_n_heads:    usize,
+    /// Depth-decoder KV heads (GQA). CSM-1B: 2.
+    pub decoder_n_kv_heads: usize,
+    /// Depth-decoder FFN dimension. CSM-1B: 8192.
+    pub decoder_ffn_dim:    usize,
+    /// Depth-decoder RoPE base. CSM-1B: 500_000.0.
+    pub decoder_rope_base:  f32,
+    /// Depth-decoder RoPE scale factor. CSM-1B: 32.0.
+    pub decoder_rope_scale: f32,
+
+    // ── Vocab / codebooks ─────────────────────────────────────────────────────
+    /// Text BPE vocabulary size (Llama 3.2 tokenizer). CSM-1B: 128_256.
+    pub text_vocab_size:      usize,
+    /// Audio token vocabulary size per codebook.
+    /// CSM-1B: 2051 (EOS=0, normal=1..2048, pad=2050).
+    pub audio_vocab_size:     usize,
+    /// Total active RVQ codebooks. CSM-1B: 32.
+    pub audio_num_codebooks:  usize,
+    /// Frame tensor width = `audio_num_codebooks + 1` (last col = text). CSM-1B: 33.
+    pub frame_width:          usize,
+
+    // ── Sequence ──────────────────────────────────────────────────────────────
+    /// Maximum backbone context length (in frames). CSM-1B: 2048.
+    pub max_seq_len: usize,
+}
+
+impl CsmConfig {
+    /// Full CSM-1B configuration.
+    ///
+    /// All values are drawn from the SesameAILabs/csm-1b HuggingFace checkpoint.
+    pub fn csm_1b() -> Self {
+        let audio_num_codebooks = 32;
+        Self {
+            backbone_n_layers:   16,
+            backbone_d_model:    2048,
+            backbone_n_heads:    32,
+            backbone_n_kv_heads: 8,
+            backbone_ffn_dim:    8192,
+            backbone_rope_base:  500_000.0,
+            backbone_rope_scale: 32.0,
+
+            decoder_n_layers:   4,
+            decoder_d_model:    1024,
+            decoder_n_heads:    8,
+            decoder_n_kv_heads: 2,
+            decoder_ffn_dim:    8192,
+            decoder_rope_base:  500_000.0,
+            decoder_rope_scale: 32.0,
+
+            text_vocab_size:     128_256,
+            audio_vocab_size:    2051,
+            audio_num_codebooks,
+            frame_width:         audio_num_codebooks + 1,   // 33
+
+            max_seq_len: 2048,
+        }
+    }
+
+    /// Total audio embedding table size = `audio_vocab_size × audio_num_codebooks`.
+    ///
+    /// Corresponds to the `audio_embeddings` weight shape `[65_632, 2048]`
+    /// in the CSM-1B checkpoint (32 × 2051 = 65_632).
+    pub fn audio_embed_table_size(&self) -> usize {
+        self.audio_vocab_size * self.audio_num_codebooks
+    }
+
+    /// Number of depth-decoder steps (= `audio_num_codebooks − 1`).
+    ///
+    /// Backbone predicts CB0; the depth decoder predicts CB1..CB(n−1).
+    pub fn n_dep_codebooks(&self) -> usize {
+        self.audio_num_codebooks.saturating_sub(1)
+    }
+}

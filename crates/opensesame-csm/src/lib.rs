@@ -18,7 +18,7 @@
 //!
 //! // Streaming session
 //! let mut session = CsmSession::new(model);
-//! session.push_audio(&pcm_samples);
+//! session.push_audio(&[]);
 //! let frame_pcm = session.generate_next_frame(Some(42));
 //! ```
 //!
@@ -34,15 +34,20 @@
 //! ```
 
 pub mod config;
+pub mod frame;
 pub mod model;
 pub mod projection;
 pub mod session;
+pub mod weight_loader;
 pub mod loss;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
-/// Full model configuration (Mimi + Backbone + Depformer).
+/// Full model configuration (Mimi + Backbone + Depformer), composite style.
 pub use config::CsmModelConfig;
+
+/// Flat model configuration with all fields explicit (for weight loading).
+pub use config::CsmConfig;
 
 /// The CSM model struct and generation output.
 pub use model::{CsmModel, GenerateOutput};
@@ -52,3 +57,19 @@ pub use projection::Projection;
 
 /// Streaming generation session.
 pub use session::CsmSession;
+
+/// Frame tokenization helpers.
+pub use frame::Frame;
+
+/// Safetensors weight loader.
+pub use weight_loader::{
+    load_csm_from_safetensors,
+    CsmError,
+    KEY_TEXT_EMBEDDINGS,
+    KEY_AUDIO_EMBEDDINGS,
+    KEY_CODEBOOK0_HEAD,
+    KEY_AUDIO_HEAD,
+    KEY_EMBEDS_PROJECTOR,
+    BACKBONE_LAYER_PREFIX,
+    DECODER_LAYER_PREFIX,
+};
