@@ -7,21 +7,40 @@ use atlas_model::{ModelConfig, RopeScaling};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Text vocabulary size (Llama 3 BPE tokenizer).
-pub const TEXT_VOCAB_SIZE: usize = 128_000;
+/// Text vocabulary size — Llama 3.2 tokenizer (confirmed from SesameAILabs/csm models.py).
+///
+/// Note: 128_256, NOT 128_000 (the extra 256 are special tokens including BOS/EOS).
+pub const TEXT_VOCAB_SIZE: usize = 128_256;
 
-/// Audio vocabulary size per codebook (Mimi quantizer).
+/// Audio vocabulary size per codebook (Mimi RVQ, verified from CSM-1B).
 pub const AUDIO_VOCAB_SIZE: usize = 2_048;
 
-/// Number of audio codebooks used by OpenSesame (CB0..CB7).
-pub const N_CODEBOOKS: usize = 8;
+/// Number of audio codebooks in CSM-1B (verified from SesameAILabs/csm generator.py:
+/// ).
+///
+/// The backbone predicts CB0; the Depformer predicts CB1..31.
+pub const AUDIO_NUM_CODEBOOKS: usize = 32;
+
+/// Legacy alias — matches Python `audio_num_codebooks` in ModelArgs.
+pub const N_CODEBOOKS: usize = AUDIO_NUM_CODEBOOKS;
+
+/// Frame width = number of columns per sequence position.
+///
+/// Each position holds  audio token columns (0..31)
+/// plus 1 text token column (col 32).
+/// Shape: (seq_len, FRAME_WIDTH).
+pub const FRAME_WIDTH: usize = AUDIO_NUM_CODEBOOKS + 1; // = 33
+
+/// Backbone (Llama-3.2-1B) embedding / hidden dimension.
+pub const BACKBONE_DIM: usize = 2_048;
+
+/// Depth decoder (Llama-3.2-100M) embedding / hidden dimension.
+pub const DECODER_DIM: usize = 1_024;
 
 /// Padding token index in the text vocabulary.
-/// Any token id ≥ TEXT_VOCAB_SIZE is treated as padding.
 pub const TEXT_PAD_TOKEN: u32 = TEXT_VOCAB_SIZE as u32;
 
 /// Padding token index within a single codebook's slice.
-/// Per codebook `k`, the actual flat index is `k * (AUDIO_VOCAB_SIZE + 1) + AUDIO_PAD_TOKEN`.
 pub const AUDIO_PAD_TOKEN: u32 = AUDIO_VOCAB_SIZE as u32;
 
 // ── BackboneConfig ────────────────────────────────────────────────────────────
@@ -74,7 +93,7 @@ impl BackboneConfig {
             ffn_dim:           8192,
             text_vocab_size:   TEXT_VOCAB_SIZE,
             audio_vocab_size:  AUDIO_VOCAB_SIZE,
-            n_audio_codebooks: N_CODEBOOKS,
+            n_audio_codebooks: AUDIO_NUM_CODEBOOKS,  // 32
             max_seq_len:       2048,
             rope_theta:        500_000.0,
             norm_eps:          1e-5,
@@ -200,13 +219,13 @@ impl CsmConfig {
             backbone_norm_eps:   1e-5,
             text_vocab_size:     TEXT_VOCAB_SIZE,
             audio_vocab_size:    AUDIO_VOCAB_SIZE,
-            n_codebooks:         N_CODEBOOKS,
+            n_codebooks:         AUDIO_NUM_CODEBOOKS,  // 32
             dep_d_model:         1024,
             dep_n_layers:        4,
             dep_n_heads:         8,
             dep_n_kv_heads:      2,
             dep_ffn_dim:         8192,
-            dep_max_seq:         N_CODEBOOKS,
+            dep_max_seq:         AUDIO_NUM_CODEBOOKS,  // 32
             dep_rope_base:       500_000.0,
         }
     }
@@ -279,9 +298,9 @@ mod tests {
         assert_eq!(cfg.n_heads, 32);
         assert_eq!(cfg.n_kv_heads, 8);
         assert_eq!(cfg.ffn_dim, 8192);
-        assert_eq!(cfg.text_vocab_size, 128_000);
+        assert_eq!(cfg.text_vocab_size, 128_256, "text_vocab_size = 128_256 (official CSM)");
         assert_eq!(cfg.audio_vocab_size, 2_048);
-        assert_eq!(cfg.n_audio_codebooks, 8);
+        assert_eq!(cfg.n_audio_codebooks, 32, "CSM-1B uses 32 codebooks");
         assert_eq!(cfg.max_seq_len, 2048);
         assert!((cfg.rope_theta - 500_000.0).abs() < 1.0);
     }
@@ -301,7 +320,7 @@ mod tests {
         let cfg = CsmConfig::opensesame_1b();
         assert_eq!(cfg.backbone_n_layers, 16);
         assert_eq!(cfg.dep_n_layers, 4);
-        assert_eq!(cfg.n_codebooks, 8);
+        assert_eq!(cfg.n_codebooks, 32, "CSM-1B uses 32 codebooks");
     }
 
     #[test]

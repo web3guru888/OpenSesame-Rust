@@ -210,10 +210,10 @@ impl Mimi {
         // SplitRVQ decode → [T_q, 256]
         let quant_out = self.quantizer.decode(codes);
 
-        // Project 256 → 512
+        // Project 256 → 512 (after RVQ, before upsample)
         let proj_out = self.proj_up.forward(&quant_out, t_q);
 
-        // ConvTrUpsample → [T_s, 512]
+        // ConvTrUpsample: [T_q, 512] → [T_s, 512]  (upsample at full dim)
         let (us_out, t_s) = self.upsample.forward(&proj_out, t_q);
 
         // In-codec transformer → [T_s, 512]
@@ -361,5 +361,93 @@ mod tests {
     fn test_projection_shape() {
         let p = Projection::new(512, 256);
         assert_eq!(p.forward(&vec![0.5_f32; 4 * 512], 4).len(), 4 * 256);
+    
+    // ── CSM-1B integration tests (32 codebooks) ──────────────────────────────
+
+    #[test]
+    fn test_csm_32cb_encode_1frame() {
+        // CSM-1B uses 32 codebooks: mimi.set_num_codebooks(32)
+        let mut mimi = Mimi::new(MimiConfig {
+            transformer_layers: 1,
+            transformer_context: 16,
+            num_codebooks: 32,
+            max_codebooks: 32,
+            ..MimiConfig::default()
+        });
+        mimi.set_num_codebooks(32);
+        let codes = mimi.encode(&vec![0.1_f32; 1920], 1920);
+        assert_eq!(codes.len(), 32, "CSM-1B: 32 codebooks");
+        assert_eq!(codes[0].len(), 1, "1 code frame");
     }
+
+    #[test]
+    fn test_csm_32cb_encode_decode_roundtrip() {
+        // Encode 2 frames with 32 codebooks, decode, check shape
+        let mimi = Mimi::new(MimiConfig {
+            transformer_layers: 1,
+            transformer_context: 16,
+            num_codebooks: 32,
+            max_codebooks: 32,
+            ..MimiConfig::default()
+        });
+        let audio = vec![0.05_f32; 3840]; // 2 frames
+        let codes = mimi.encode(&audio, 3840);
+        assert_eq!(codes.len(), 32);
+        assert_eq!(codes[0].len(), 2);
+        let (decoded, _) = mimi.decode(&codes);
+        assert!(!decoded.is_empty(), "decoded output must be non-empty");
+        // Decoded length: 2 frames × 1920 samples/frame = 3840 samples
+        assert_eq!(decoded.len(), 3840, "decoded length = 2 frames = 3840 samples");
+    }
+
+    #[test]
+    fn test_csm_32cb_codes_in_range() {
+        // All 32-codebook tokens must be < vocab_size (2048)
+        let mimi = Mimi::new(MimiConfig {
+            transformer_layers: 1,
+            transformer_context: 16,
+            num_codebooks: 32,
+            max_codebooks: 32,
+            ..MimiConfig::default()
+        });
+        let codes = mimi.encode(&vec![0.0_f32; 1920], 1920);
+        for (cb, row) in codes.iter().enumerate() {
+            for &token in row {
+                assert!(
+                    (token as usize) < 2048,
+                    "codebook {cb} token {token} >= vocab_size 2048"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_set_num_codebooks_then_encode_32() {
+        // Start with 8-codebook config, switch to 32 via set_num_codebooks
+        let mut mimi = Mimi::new(MimiConfig {
+            transformer_layers: 1,
+            transformer_context: 16,
+            num_codebooks: 8,
+            max_codebooks: 32,  // allow up to 32
+            ..MimiConfig::default()
+        });
+        assert_eq!(mimi.num_codebooks(), 8);
+        // Matches: mimi.set_num_codebooks(32) in generator.py
+        mimi.set_num_codebooks(32);
+        assert_eq!(mimi.num_codebooks(), 32);
+        let codes = mimi.encode(&vec![0.0_f32; 1920], 1920);
+        assert_eq!(codes.len(), 32, "32 codebooks after set_num_codebooks");
+    }
+
+    #[test]
+    fn test_decode_output_finite() {
+        let mimi = Mimi::new(small_cfg());
+        let codes: Vec<Vec<u32>> = (0..8).map(|_| vec![42u32, 100u32]).collect();
+        let (pcm, _) = mimi.decode(&codes);
+        for (i, &v) in pcm.iter().enumerate() {
+            assert!(v.is_finite(), "decoded[{i}] = {v} is not finite");
+        }
+    }
+
+}
 }

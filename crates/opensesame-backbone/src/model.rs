@@ -1,453 +1,318 @@
-//! CSM backbone model — multimodal embedding + dual output heads.
+//! CSM backbone and depth-decoder model definitions.
 //!
-//! The `BackboneModel` wraps an `atlas_model::OlmoModel` (16-layer Llama-3.2-1B)
-//! and adds:
-//! - `CsmEmbedding` — summed text+audio embeddings injected via `forward_hidden_raw`
-//! - `audio_head`   — CB0 prediction: `Linear(d_model → audio_vocab_size)`
-//! - `text_head`    — Inner Monologue: `Linear(d_model → text_vocab_size)`
+//! This module provides the top-level struct definitions for the CSM-1B model,
+//! including the `ModelConfig` type that matches `ModelArgs` in
+//! `SesameAILabs/csm/models.py` (Apache 2.0).
 //!
-//! During inference, call `forward()` (batch mode) or `forward_step()` (one token
-//! at a time) to obtain `BackboneOutput`.
+//! # Architecture (confirmed from official source)
+//!
+//! ```text
+//! Backbone  — Llama-3.2-1B (16L, d=2048, 32H/8KV, ffn=8192)
+//! Decoder   — Llama-3.2-100M (4L, d=1024, 8H/2KV, ffn=8192)
+//! Embeddings:
+//!   text_embeddings:   Embedding(128_256, 2048)
+//!   audio_embeddings:  Embedding(65_536, 2048)  ← 32 × 2048 codebook entries
+//! Projection:          Linear(2048 → 1024, bias=False)
+//! codebook0_head:      Linear(2048 → 2048, bias=False)  ← predicts CB0
+//! audio_head:          Parameter(31, 1024, 2048)         ← depth decoder heads CB1..31
+//! ```
+//!
+//! # Frame representation
+//! Each sequence position = one Mimi frame.  Shape `(seq_len, 33)`:
+//! - Columns 0..31: audio codebook tokens (CB0..CB31)
+//! - Column 32: text token
+//! Masked embeddings summed along dim=2 → `(batch, seq_len, backbone_dim)`.
+//!
+//! # References
+//! - `SesameAILabs/csm models.py` (Apache 2.0)
+//! - `SesameAILabs/csm generator.py` (Apache 2.0)
 
-use atlas_model::OlmoModel;
-
-use crate::{
-    config::{BackboneConfig, AUDIO_VOCAB_SIZE},
-    embedding::CsmEmbedding,
-    heads::linear_forward,
-    loader::load_weights_from_safetensors,
+use crate::config::{
+    AUDIO_NUM_CODEBOOKS, AUDIO_VOCAB_SIZE, BACKBONE_DIM, DECODER_DIM, FRAME_WIDTH,
+    TEXT_VOCAB_SIZE,
 };
 
-// ── BackboneOutput ────────────────────────────────────────────────────────────
+// ── BackboneFlavor ────────────────────────────────────────────────────────────
 
-/// Output from a `BackboneModel` forward pass.
-pub struct BackboneOutput {
-    /// CB0 audio logits: `[B × T × audio_vocab_size]` flat.
-    pub audio_logits: Vec<f32>,
-    /// Inner Monologue text logits: `[B × T × text_vocab_size]` flat.
-    pub text_logits: Vec<f32>,
-    /// Final transformer hidden states: `[B × T × d_model]` flat.
-    /// Used by the Depformer to generate CB1..CB7.
-    pub hidden_states: Vec<f32>,
-}
-
-// ── BackboneModel ─────────────────────────────────────────────────────────────
-
-/// The CSM backbone transformer.
+/// Which Llama 3.2 variant to use for backbone or depth decoder.
 ///
-/// Combines a Llama-3.2-1B-compatible transformer (via `OlmoModel`) with
-/// multimodal embeddings and dual output heads.
-///
-/// # Forward pass
-///
-/// For each sequence position the embedding is computed as:
+/// Matches the `FLAVORS` dictionary in `SesameAILabs/csm models.py`:
 /// ```text
-/// embed[t] = sum(text_emb[text_token[t]], audio_emb[cb0][code0], ..., audio_emb[cb7][code7])
+/// FLAVORS = {"llama-1B": llama3_2_1B, "llama-100M": llama3_2_100M}
 /// ```
-/// The summed embedding is passed through the transformer via
-/// `OlmoModel::forward_hidden_raw`, bypassing the standard token embedding lookup
-/// and LM head.  The hidden state is then projected through both output heads.
-pub struct BackboneModel {
-    /// Multimodal embedding module.
-    pub embedding: CsmEmbedding,
-    /// 16-layer Llama-3.2-1B transformer.
-    pub transformer: OlmoModel,
-    /// CB0 audio head weights: `[audio_vocab_size × d_model]` row-major.
-    pub audio_head: Vec<f32>,
-    /// CB0 audio head bias: `[audio_vocab_size]` (zeros if none).
-    pub audio_head_bias: Vec<f32>,
-    /// Text (Inner Monologue) head weights: `[text_vocab_size × d_model]` row-major.
-    pub text_head: Vec<f32>,
-    /// Text head bias: `[text_vocab_size]` (zeros if none).
-    pub text_head_bias: Vec<f32>,
-    /// Model configuration.
-    pub config: BackboneConfig,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackboneFlavor {
+    /// Llama-3.2-1B: 16 layers, d=2048, 32 heads, 8 KV heads, ffn=8192.
+    ///
+    /// Used as the main backbone (processes full multimodal context).
+    Llama1B,
+    /// Llama-3.2-100M: 4 layers, d=1024, 8 heads, 2 KV heads, ffn=8192.
+    ///
+    /// Used as the depth decoder (generates codebooks 1..31 per frame).
+    Llama100M,
 }
 
-impl BackboneModel {
-    /// Create a new `BackboneModel` with random weights (for training from scratch).
-    ///
-    /// The transformer is initialised with `OlmoModel::new()`, the embedding
-    /// tables with `CsmEmbedding::new()`, and both heads with small random weights.
-    pub fn new(config: BackboneConfig) -> Self {
-        let mc = config.to_model_config();
-        let transformer = OlmoModel::new(mc);
-        let embedding = CsmEmbedding::new(config.clone());
-
-        let d  = config.d_model;
-        let av = AUDIO_VOCAB_SIZE;
-        let tv = config.text_vocab_size;
-
-        // Audio head: Linear(d_model → audio_vocab_size), no bias
-        let audio_head = random_weights(av * d, 0xdeadbeef_cafef00d);
-        let audio_head_bias = vec![0.0f32; av];
-
-        // Text head: Linear(d_model → text_vocab_size), no bias (large!)
-        let text_head = random_weights(tv * d, 0xabcd1234_5678ef90);
-        let text_head_bias = vec![0.0f32; tv];
-
-        Self {
-            embedding,
-            transformer,
-            audio_head,
-            audio_head_bias,
-            text_head,
-            text_head_bias,
-            config,
+impl BackboneFlavor {
+    /// Hidden dimension for this flavor.
+    pub fn embed_dim(self) -> usize {
+        match self {
+            Self::Llama1B   => BACKBONE_DIM,   // 2048
+            Self::Llama100M => DECODER_DIM,    // 1024
         }
     }
 
-    /// Full forward pass over a batch of sequences.
-    ///
-    /// - `tokens_text`:  `[B × T]` flat, `u32::MAX` = no text token (pad).
-    /// - `tokens_audio`: `[B × T × n_audio_codebooks]` flat, `u32::MAX` = pad.
-    /// - Returns `BackboneOutput` with shapes:
-    ///   - `audio_logits`: `[B × T × audio_vocab_size]`
-    ///   - `text_logits`:  `[B × T × text_vocab_size]`
-    ///   - `hidden_states`: `[B × T × d_model]`
-    pub fn forward(
-        &mut self,
-        tokens_text:  &[u32],
-        tokens_audio: &[u32],
-        batch:   usize,
-        seq_len: usize,
-    ) -> BackboneOutput {
-        let d  = self.config.d_model;
-        let av = AUDIO_VOCAB_SIZE;
-        let tv = self.config.text_vocab_size;
-        let total = batch * seq_len;
-
-        // Compute multimodal embeddings for the full batch
-        let embeds = self.embedding.embed_sequence(
-            tokens_text, tokens_audio, batch, seq_len,
-        );
-        // embeds: [B × T × d_model]
-
-        // Reset transformer KV cache for a fresh sequence
-        self.transformer.reset();
-
-        // Run each position through the transformer
-        let mut hidden_states = Vec::with_capacity(total * d);
-        for pos in 0..total {
-            let embed = embeds[pos * d..(pos + 1) * d].to_vec();
-            let h = self.transformer.forward_hidden_raw(embed);
-            hidden_states.extend(h);
-        }
-
-        // Apply audio head: [total × d] → [total × audio_vocab_size]
-        let audio_logits = linear_forward(
-            &hidden_states,
-            &self.audio_head,
-            &self.audio_head_bias,
-            total, d, av,
-        );
-
-        // Apply text head: [total × d] → [total × text_vocab_size]
-        let text_logits = linear_forward(
-            &hidden_states,
-            &self.text_head,
-            &self.text_head_bias,
-            total, d, tv,
-        );
-
-        BackboneOutput {
-            audio_logits,
-            text_logits,
-            hidden_states,
+    /// Number of transformer layers for this flavor.
+    pub fn num_layers(self) -> usize {
+        match self {
+            Self::Llama1B   => 16,
+            Self::Llama100M => 4,
         }
     }
 
-    /// Single-step autoregressive forward.
-    ///
-    /// Feeds one position to the transformer (maintaining KV cache state from
-    /// previous calls).  Useful during autoregressive inference.
-    ///
-    /// `text_token`:   `None` → text pad; `Some(id)` → text token.
-    /// `audio_tokens`: `&[Option<u32>]` of length `n_audio_codebooks`.
-    ///
-    /// Returns a `BackboneOutput` with shapes `[1 × 1 × *]` (batch=1, seq=1).
-    pub fn forward_step(
-        &mut self,
-        text_token:   Option<u32>,
-        audio_tokens: &[Option<u32>],
-    ) -> BackboneOutput {
-        let d  = self.config.d_model;
-        let av = AUDIO_VOCAB_SIZE;
-        let tv = self.config.text_vocab_size;
-
-        let embed = self.embedding.embed_position(text_token, audio_tokens);
-        let h = self.transformer.forward_hidden_raw(embed);
-
-        let audio_logits = {
-            let mut logits = vec![0.0f32; av];
-            for i in 0..av {
-                let row = &self.audio_head[i * d..(i + 1) * d];
-                logits[i] = row.iter().zip(h.iter()).map(|(&w, &x)| w * x).sum::<f32>()
-                    + self.audio_head_bias[i];
-            }
-            logits
-        };
-
-        let text_logits = {
-            let mut logits = vec![0.0f32; tv];
-            for i in 0..tv {
-                let row = &self.text_head[i * d..(i + 1) * d];
-                logits[i] = row.iter().zip(h.iter()).map(|(&w, &x)| w * x).sum::<f32>()
-                    + self.text_head_bias[i];
-            }
-            logits
-        };
-
-        BackboneOutput {
-            audio_logits,
-            text_logits,
-            hidden_states: h,
+    /// Number of query attention heads for this flavor.
+    pub fn num_heads(self) -> usize {
+        match self {
+            Self::Llama1B   => 32,
+            Self::Llama100M => 8,
         }
     }
 
-    /// Load backbone weights from a safetensors file.
-    ///
-    /// Currently validates that the file can be opened; full weight injection
-    /// is implemented in `loader.rs` / Phase H.
-    pub fn load_weights(&mut self, path: &str) -> Result<(), String> {
-        load_weights_from_safetensors(path)
+    /// Number of key-value heads (GQA) for this flavor.
+    pub fn num_kv_heads(self) -> usize {
+        match self {
+            Self::Llama1B   => 8,
+            Self::Llama100M => 2,
+        }
     }
 
-    /// Return the current KV-cache position (number of tokens processed since last reset).
-    pub fn pos(&self) -> usize {
-        self.transformer.pos()
+    /// FFN intermediate dimension for this flavor.
+    pub fn intermediate_dim(self) -> usize {
+        // Both 1B and 100M share the same intermediate dimension.
+        8192
     }
 
-    /// Reset the KV cache and position counter.
-    pub fn reset(&mut self) {
-        self.transformer.reset();
+    /// RoPE base frequency for this flavor.
+    pub fn rope_base(self) -> f32 {
+        // Both variants use the Llama 3.2 extended context RoPE base.
+        500_000.0
+    }
+
+    /// RoPE YaRN scale factor for this flavor.
+    pub fn scale_factor(self) -> f32 {
+        32.0
+    }
+
+    /// RMSNorm epsilon for this flavor.
+    pub fn norm_eps(self) -> f32 {
+        1e-5
+    }
+
+    /// Maximum sequence length for this flavor.
+    pub fn max_seq_len(self) -> usize {
+        2048
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── ModelConfig ───────────────────────────────────────────────────────────────
 
-/// Generate `n` pseudo-random f32 values in `[-scale, +scale)`.
+/// Full CSM-1B model configuration.
 ///
-/// Uses a simple xorshift64 PRNG — no external crate required.
-fn random_weights(n: usize, seed: u64) -> Vec<f32> {
-    // Scale by 1/sqrt(n) as a reasonable initialisation
-    let scale = 1.0 / (n as f32).sqrt();
-    let mut v = Vec::with_capacity(n);
-    let mut s = seed | 1;
-    for _ in 0..n {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        let f = (s >> 11) as f32 / (1u64 << 53) as f32;
-        v.push((f * 2.0 - 1.0) * scale);
-    }
-    v
+/// Matches `ModelArgs` in `SesameAILabs/csm models.py` (Apache 2.0):
+/// ```text
+/// @dataclass
+/// class ModelArgs:
+///     backbone_flavor: str
+///     decoder_flavor: str
+///     text_vocab_size: int
+///     audio_vocab_size: int
+///     audio_num_codebooks: int
+/// ```
+///
+/// # CSM-1B defaults
+/// ```ignore
+/// let cfg = ModelConfig::csm_1b();
+/// assert_eq!(cfg.text_vocab_size, 128_256);
+/// assert_eq!(cfg.audio_vocab_size, 2048);
+/// assert_eq!(cfg.audio_num_codebooks, 32);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ModelConfig {
+    /// Which Llama variant to use for the backbone transformer.
+    pub backbone_flavor: BackboneFlavor,
+    /// Which Llama variant to use for the depth decoder transformer.
+    pub decoder_flavor: BackboneFlavor,
+    /// Text (BPE) vocabulary size — 128_256 for Llama 3.2 tokenizer.
+    pub text_vocab_size: usize,
+    /// Audio codebook vocabulary size — 2048 for Mimi RVQ.
+    pub audio_vocab_size: usize,
+    /// Number of audio codebooks — 32 for CSM-1B.
+    ///
+    /// The backbone predicts CB0; the depth decoder predicts CB1..`audio_num_codebooks-1`.
+    pub audio_num_codebooks: usize,
 }
+
+impl ModelConfig {
+    /// Standard CSM-1B configuration (confirmed from `SesameAILabs/csm models.py`).
+    ///
+    /// ```text
+    /// # From generator.py:
+    /// model = Model.from_pretrained("sesame/csm-1b")
+    /// # From models.py:
+    /// ModelArgs(
+    ///     backbone_flavor="llama-1B",
+    ///     decoder_flavor="llama-100M",
+    ///     text_vocab_size=128_256,
+    ///     audio_vocab_size=2048,
+    ///     audio_num_codebooks=32,
+    /// )
+    /// ```
+    pub fn csm_1b() -> Self {
+        Self {
+            backbone_flavor:      BackboneFlavor::Llama1B,
+            decoder_flavor:       BackboneFlavor::Llama100M,
+            text_vocab_size:      TEXT_VOCAB_SIZE,    // 128_256
+            audio_vocab_size:     AUDIO_VOCAB_SIZE,   // 2_048
+            audio_num_codebooks:  AUDIO_NUM_CODEBOOKS, // 32
+        }
+    }
+
+    /// Total number of audio embedding table entries.
+    ///
+    /// `audio_vocab_size × audio_num_codebooks = 2048 × 32 = 65_536`.
+    /// Each codebook `k` occupies entries `[k × audio_vocab_size, (k+1) × audio_vocab_size)`.
+    pub fn audio_embedding_count(&self) -> usize {
+        self.audio_vocab_size * self.audio_num_codebooks
+    }
+
+    /// Frame width = number of token columns per sequence position.
+    ///
+    /// `audio_num_codebooks + 1` = 33 for CSM-1B.
+    /// Column 32 is the text token; columns 0..31 are audio codebook tokens.
+    pub fn frame_width(&self) -> usize {
+        self.audio_num_codebooks + 1
+    }
+
+    /// Number of depth-decoder steps per frame (CB1..CB31 = 31 steps).
+    ///
+    /// The backbone predicts CB0 directly; the depth decoder handles the rest.
+    pub fn depth_steps(&self) -> usize {
+        self.audio_num_codebooks - 1
+    }
+
+    /// Shape of the `audio_head` parameter: `(depth_steps, decoder_dim, audio_vocab_size)`.
+    ///
+    /// = `(31, 1024, 2048)` for CSM-1B.
+    pub fn audio_head_shape(&self) -> (usize, usize, usize) {
+        (
+            self.depth_steps(),
+            self.decoder_flavor.embed_dim(),
+            self.audio_vocab_size,
+        )
+    }
+}
+
+// ── CSM weight names ──────────────────────────────────────────────────────────
+
+/// Top-level parameter names for a CSM-1B checkpoint, matching
+/// `SesameAILabs/csm models.py` / HuggingFace safetensors layout.
+pub struct CsmWeightKeys;
+
+impl CsmWeightKeys {
+    /// Text embedding table: `Embedding(128_256, 2048)`.
+    pub const TEXT_EMBEDDINGS:   &'static str = "text_embeddings.weight";
+    /// Audio embedding table: `Embedding(65_536, 2048)`.
+    pub const AUDIO_EMBEDDINGS:  &'static str = "audio_embeddings.weight";
+    /// Backbone → decoder projection: `Linear(2048, 1024, bias=False)`.
+    pub const PROJECTION:        &'static str = "projection.weight";
+    /// CB0 prediction head: `Linear(2048, 2048, bias=False)`.
+    pub const CODEBOOK0_HEAD:    &'static str = "codebook0_head.weight";
+    /// Depth decoder audio heads: `Parameter(31, 1024, 2048)`.
+    pub const AUDIO_HEAD:        &'static str = "audio_head";
+    /// Backbone transformer layers prefix.
+    pub const BACKBONE_PREFIX:   &'static str = "backbone.";
+    /// Depth decoder transformer layers prefix.
+    pub const DECODER_PREFIX:    &'static str = "decoder.";
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BackboneConfig;
-
-    /// Build a tiny BackboneModel (2 layers, d=64) for fast tests.
-    fn tiny_model() -> BackboneModel {
-        BackboneModel::new(BackboneConfig::tiny())
-    }
-
-    // ── Shape tests ────────────────────────────────────────────────────────
 
     #[test]
-    fn test_backbone_forward_shape() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let B = 1usize;
-        let T = 2usize;
-        let n_cb = cfg.n_audio_codebooks;
-        let text  = vec![0u32; B * T];
-        let audio = vec![0u32; B * T * n_cb];
-        let out = m.forward(&text, &audio, B, T);
-        assert_eq!(out.hidden_states.len(), B * T * cfg.d_model);
-        assert_eq!(out.audio_logits.len(), B * T * AUDIO_VOCAB_SIZE);
-        assert_eq!(out.text_logits.len(),  B * T * cfg.text_vocab_size);
+    fn test_model_config_csm1b_vocab() {
+        let cfg = ModelConfig::csm_1b();
+        assert_eq!(cfg.text_vocab_size, 128_256, "text vocab = 128_256");
+        assert_eq!(cfg.audio_vocab_size, 2_048, "audio vocab = 2048");
+        assert_eq!(cfg.audio_num_codebooks, 32, "32 codebooks");
     }
 
     #[test]
-    fn test_backbone_audio_logits_shape() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let B = 1usize; let T = 2usize;
-        let text  = vec![1u32; B * T];
-        let audio = vec![2u32; B * T * cfg.n_audio_codebooks];
-        let out = m.forward(&text, &audio, B, T);
-        // audio_vocab_size stays at AUDIO_VOCAB_SIZE=2048 regardless of tiny config
-        assert_eq!(out.audio_logits.len(), B * T * AUDIO_VOCAB_SIZE);
+    fn test_model_config_frame_width() {
+        let cfg = ModelConfig::csm_1b();
+        assert_eq!(cfg.frame_width(), 33, "frame_width = 33 (32 audio + 1 text)");
     }
 
     #[test]
-    fn test_backbone_text_logits_shape() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let B = 1usize; let T = 2usize;
-        let text  = vec![0u32; B * T];
-        let audio = vec![0u32; B * T * cfg.n_audio_codebooks];
-        let out = m.forward(&text, &audio, B, T);
-        assert_eq!(out.text_logits.len(), B * T * cfg.text_vocab_size);
+    fn test_model_config_audio_embedding_count() {
+        let cfg = ModelConfig::csm_1b();
+        assert_eq!(cfg.audio_embedding_count(), 65_536, "65_536 audio embedding entries");
     }
 
     #[test]
-    fn test_backbone_hidden_shape() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let B = 1usize; let T = 2usize;
-        let text  = vec![0u32; B * T];
-        let audio = vec![0u32; B * T * cfg.n_audio_codebooks];
-        let out = m.forward(&text, &audio, B, T);
-        assert_eq!(out.hidden_states.len(), B * T * cfg.d_model);
+    fn test_model_config_depth_steps() {
+        let cfg = ModelConfig::csm_1b();
+        assert_eq!(cfg.depth_steps(), 31, "31 depth steps (CB1..31)");
     }
 
     #[test]
-    fn test_backbone_finite_outputs() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let B = 1usize; let T = 2usize;
-        let text  = vec![0u32; B * T];
-        let audio = vec![0u32; B * T * cfg.n_audio_codebooks];
-        let out = m.forward(&text, &audio, B, T);
-        assert!(out.hidden_states.iter().all(|v| v.is_finite()), "hidden has NaN/Inf");
-        assert!(out.audio_logits.iter().all(|v| v.is_finite()), "audio_logits has NaN/Inf");
-        assert!(out.text_logits.iter().all(|v| v.is_finite()), "text_logits has NaN/Inf");
+    fn test_audio_head_shape() {
+        let cfg = ModelConfig::csm_1b();
+        let shape = cfg.audio_head_shape();
+        assert_eq!(shape, (31, 1024, 2048), "audio_head shape (31, 1024, 2048)");
     }
 
     #[test]
-    fn test_backbone_text_only_seq() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let T = 2usize;
-        // All audio = u32::MAX (padding)
-        let text  = vec![5u32; T];
-        let audio = vec![u32::MAX; T * cfg.n_audio_codebooks];
-        let out = m.forward(&text, &audio, 1, T);
-        assert_eq!(out.hidden_states.len(), T * cfg.d_model);
-        assert!(out.hidden_states.iter().all(|v| v.is_finite()));
+    fn test_backbone_flavor_dims() {
+        assert_eq!(BackboneFlavor::Llama1B.embed_dim(), 2048);
+        assert_eq!(BackboneFlavor::Llama100M.embed_dim(), 1024);
+        assert_eq!(BackboneFlavor::Llama1B.num_layers(), 16);
+        assert_eq!(BackboneFlavor::Llama100M.num_layers(), 4);
+        assert_eq!(BackboneFlavor::Llama1B.num_heads(), 32);
+        assert_eq!(BackboneFlavor::Llama100M.num_heads(), 8);
+        assert_eq!(BackboneFlavor::Llama1B.num_kv_heads(), 8);
+        assert_eq!(BackboneFlavor::Llama100M.num_kv_heads(), 2);
     }
 
     #[test]
-    fn test_backbone_audio_only_seq() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let T = 2usize;
-        // All text = u32::MAX (padding)
-        let text  = vec![u32::MAX; T];
-        let audio = vec![3u32; T * cfg.n_audio_codebooks];
-        let out = m.forward(&text, &audio, 1, T);
-        assert_eq!(out.hidden_states.len(), T * cfg.d_model);
-        assert!(out.hidden_states.iter().all(|v| v.is_finite()));
+    fn test_backbone_flavor_ffn_rope() {
+        assert_eq!(BackboneFlavor::Llama1B.intermediate_dim(), 8192);
+        assert_eq!(BackboneFlavor::Llama100M.intermediate_dim(), 8192);
+        assert!((BackboneFlavor::Llama1B.rope_base() - 500_000.0).abs() < 1.0);
+        assert!((BackboneFlavor::Llama1B.scale_factor() - 32.0).abs() < 1e-6);
     }
 
     #[test]
-    fn test_backbone_mixed_seq() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let T = 4usize;
-        // Interleave text and audio positions
-        let mut text  = vec![u32::MAX; T];
-        let mut audio = vec![u32::MAX; T * cfg.n_audio_codebooks];
-        text[0] = 1;
-        text[2] = 2;
-        for cb in 0..cfg.n_audio_codebooks {
-            audio[1 * cfg.n_audio_codebooks + cb] = 5;
-            audio[3 * cfg.n_audio_codebooks + cb] = 7;
-        }
-        let out = m.forward(&text, &audio, 1, T);
-        assert!(out.hidden_states.iter().all(|v| v.is_finite()));
+    fn test_frame_width_constant() {
+        assert_eq!(FRAME_WIDTH, 33, "FRAME_WIDTH = AUDIO_NUM_CODEBOOKS + 1 = 33");
     }
 
     #[test]
-    fn test_backbone_batch2() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let T = 2usize;
-        let n_cb = cfg.n_audio_codebooks;
-
-        let text1  = vec![1u32; T];
-        let audio1 = vec![2u32; T * n_cb];
-        let out1 = m.forward(&text1, &audio1, 1, T);
-
-        m.reset();
-
-        let text2  = vec![1u32; 2 * T];
-        let audio2 = vec![2u32; 2 * T * n_cb];
-        let out2 = m.forward(&text2, &audio2, 2, T);
-
-        // B=2 produces twice as many values
-        assert_eq!(out2.hidden_states.len(), 2 * out1.hidden_states.len());
-        assert_eq!(out2.audio_logits.len(), 2 * out1.audio_logits.len());
-        assert_eq!(out2.text_logits.len(), 2 * out1.text_logits.len());
+    fn test_constants_verified() {
+        assert_eq!(AUDIO_NUM_CODEBOOKS, 32, "32 codebooks (CSM-1B)");
+        assert_eq!(AUDIO_VOCAB_SIZE, 2_048, "2048 audio vocab");
+        assert_eq!(TEXT_VOCAB_SIZE, 128_256, "128_256 text vocab");
+        assert_eq!(BACKBONE_DIM, 2048, "backbone dim = 2048");
+        assert_eq!(DECODER_DIM, 1024, "decoder dim = 1024");
     }
 
     #[test]
-    fn test_backbone_deterministic() {
-        let cfg = BackboneConfig::tiny();
-        let T = 2usize;
-        let n_cb = cfg.n_audio_codebooks;
-        let text  = vec![3u32; T];
-        let audio = vec![1u32; T * n_cb];
-
-        let mut m1 = BackboneModel::new(cfg.clone());
-        let out1 = m1.forward(&text, &audio, 1, T);
-
-        let mut m2 = BackboneModel::new(cfg.clone());
-        let out2 = m2.forward(&text, &audio, 1, T);
-
-        // Same model (same random seed logic in OlmoModel::new) → same output
-        assert_eq!(out1.hidden_states, out2.hidden_states);
-    }
-
-    // ── forward_step ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_forward_step_shape() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let audio: Vec<Option<u32>> = vec![Some(1); cfg.n_audio_codebooks];
-        let out = m.forward_step(Some(5), &audio);
-        assert_eq!(out.hidden_states.len(), cfg.d_model);
-        assert_eq!(out.audio_logits.len(), AUDIO_VOCAB_SIZE);
-        assert_eq!(out.text_logits.len(), cfg.text_vocab_size);
-    }
-
-    #[test]
-    fn test_forward_step_finite() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let audio: Vec<Option<u32>> = vec![None; cfg.n_audio_codebooks];
-        let out = m.forward_step(None, &audio);
-        assert!(out.hidden_states.iter().all(|v| v.is_finite()));
-        assert!(out.audio_logits.iter().all(|v| v.is_finite()));
-        assert!(out.text_logits.iter().all(|v| v.is_finite()));
-    }
-
-    // ── Weight loading ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_load_weights_missing_file() {
-        let mut m = tiny_model();
-        let result = m.load_weights("/tmp/definitely_does_not_exist_phase_f.safetensors");
-        assert!(result.is_err());
-    }
-
-    // ── Misc ───────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_backbone_pos_resets() {
-        let mut m = tiny_model();
-        let cfg = BackboneConfig::tiny();
-        let T = 3usize;
-        let text  = vec![0u32; T];
-        let audio = vec![0u32; T * cfg.n_audio_codebooks];
-        m.forward(&text, &audio, 1, T);
-        assert_eq!(m.pos(), T);
-        m.reset();
-        assert_eq!(m.pos(), 0);
+    fn test_weight_key_constants() {
+        assert!(CsmWeightKeys::TEXT_EMBEDDINGS.contains("text_embeddings"));
+        assert!(CsmWeightKeys::AUDIO_EMBEDDINGS.contains("audio_embeddings"));
+        assert!(CsmWeightKeys::PROJECTION.contains("projection"));
+        assert!(CsmWeightKeys::CODEBOOK0_HEAD.contains("codebook0_head"));
+        assert!(CsmWeightKeys::AUDIO_HEAD.contains("audio_head"));
     }
 }
