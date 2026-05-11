@@ -8,7 +8,4 @@ repository.workspace = true
 description = "VectorQuantizer + ResidualVQ + SplitRVQ with EMA codebook training"
 
 [dependencies]
-atlas-core   = { path = "../atlas-core" }
-atlas-tensor = { path = "../atlas-tensor" }
-atlas-grad   = { path = "../atlas-grad" }
-opensesame-audio = { path = "../opensesame-audio" }
+atlas-core = { path = "../atlas-core" }

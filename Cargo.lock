@@ -303,9 +303,6 @@ name = "opensesame-rvq"
 version = "0.1.0"
 dependencies = [
  "atlas-core",
- "atlas-grad",
- "atlas-tensor",
- "opensesame-audio",
 ]
 
 [[package]]
