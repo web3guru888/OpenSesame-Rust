@@ -361,6 +361,7 @@ mod tests {
     fn test_projection_shape() {
         let p = Projection::new(512, 256);
         assert_eq!(p.forward(&vec![0.5_f32; 4 * 512], 4).len(), 4 * 256);
+    }
     
     // ── CSM-1B integration tests (32 codebooks) ──────────────────────────────
 
@@ -450,4 +451,4 @@ mod tests {
     }
 
 }
-}
+
