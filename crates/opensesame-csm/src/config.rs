@@ -95,6 +95,7 @@ impl CsmModelConfig {
             vocab_size:      16,     // audio_vocab_size for tiny
             d_backbone:      64,     // backbone_dim for tiny
             rope_base:       10_000.0,
+            rope_scale:      1.0,
             norm_eps:        1e-5,
         };
 

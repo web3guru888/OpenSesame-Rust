@@ -308,6 +308,7 @@ fn build_model_config(cfg: &CsmConfig) -> crate::config::CsmModelConfig {
         vocab_size:      cfg.audio_vocab_size,
         d_backbone:      cfg.backbone_d_model,
         rope_base:       cfg.decoder_rope_base,
+        rope_scale:      cfg.decoder_rope_scale,
         norm_eps:        1e-5,
     };
 

@@ -12,6 +12,7 @@ atlas-core    = { path = "../atlas-core" }
 atlas-tensor  = { path = "../atlas-tensor" }
 atlas-grad    = { path = "../atlas-grad" }
 atlas-optim   = { path = "../atlas-optim" }
+atlas-json    = { path = "../atlas-json" }
 atlas-corpus  = { path = "../atlas-corpus" }
 opensesame-csm  = { path = "../opensesame-csm" }
 opensesame-data = { path = "../opensesame-data" }

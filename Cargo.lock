@@ -334,6 +334,7 @@ dependencies = [
  "atlas-core",
  "atlas-corpus",
  "atlas-grad",
+ "atlas-json",
  "atlas-optim",
  "atlas-tensor",
  "opensesame-csm",
