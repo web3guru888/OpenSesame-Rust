@@ -43,7 +43,14 @@ pub struct RVQOutput {
 /// Stacking layers progressively refines the reconstruction.
 pub struct ResidualVQ {
     /// Constituent VQ layers, one per codebook level.
-    quantizers: Vec<VectorQuantizer>,
+    pub quantizers: Vec<VectorQuantizer>,
+
+    /// Number of active quantizers used at runtime.
+    ///
+    /// Allows runtime selection of a subset of trained codebooks
+    /// (e.g. Mimi's `set_num_codebooks(n)` API). Defaults to
+    /// `quantizers.len()`. Must be ≤ `quantizers.len()`.
+    pub active_quantizers: usize,
 
     /// Configuration shared by all quantizers.
     pub config: RVQConfig,
@@ -56,8 +63,9 @@ impl ResidualVQ {
     /// hyper-parameters from `config`.
     pub fn new(config: RVQConfig) -> Self {
         let n = config.num_codebooks;
-        let quantizers = (0..n).map(|_| VectorQuantizer::new(config.clone())).collect();
-        Self { quantizers, config }
+        let quantizers: Vec<VectorQuantizer> = (0..n).map(|_| VectorQuantizer::new(config.clone())).collect();
+        let active_quantizers = quantizers.len();
+        Self { quantizers, active_quantizers, config }
     }
 
     // ── Forward ──────────────────────────────────────────────────────────────
@@ -86,7 +94,7 @@ impl ResidualVQ {
         let mut perplexities = Vec::with_capacity(self.quantizers.len());
         let mut total_commit_loss = 0.0_f32;
 
-        for vq in &mut self.quantizers {
+        for vq in self.quantizers.iter_mut().take(self.active_quantizers) {
             let out: VQOutput = vq.forward(&residual, n, d, training);
 
             // Subtract quantized from residual (in-place)
@@ -104,8 +112,8 @@ impl ResidualVQ {
             perplexities.push(out.perplexity);
         }
 
-        // Mean commit loss across all codebook levels
-        let mean_commit_loss = total_commit_loss / self.quantizers.len() as f32;
+        // Mean commit loss across active codebook levels
+        let mean_commit_loss = total_commit_loss / self.active_quantizers.max(1) as f32;
 
         RVQOutput {
             quantized: total_quantized,
@@ -125,9 +133,9 @@ impl ResidualVQ {
     /// `Vec<Vec<u32>>` with length `num_codebooks`; each inner vec has length N.
     pub fn encode(&self, z: &[f32], n: usize, d: usize) -> Vec<Vec<u32>> {
         let mut residual = z.to_vec();
-        let mut all_codes = Vec::with_capacity(self.quantizers.len());
+        let mut all_codes = Vec::with_capacity(self.active_quantizers);
 
-        for vq in &self.quantizers {
+        for vq in self.quantizers.iter().take(self.active_quantizers) {
             let codes = vq.encode(&residual, n, d);
             // Subtract quantized residual
             let quantized = vq.decode(&codes);
@@ -150,12 +158,15 @@ impl ResidualVQ {
     /// # Returns
     /// Sum of decoded embeddings across all levels, shape [N × D].
     pub fn decode(&self, codes: &[Vec<u32>]) -> Vec<f32> {
-        assert_eq!(
+        assert!(
+            !codes.is_empty(),
+            "decode: expected at least 1 code vector"
+        );
+        assert!(
+            codes.len() <= self.quantizers.len(),
+            "decode: got {} code vectors but only {} quantizers",
             codes.len(),
-            self.quantizers.len(),
-            "decode: expected {} code vectors, got {}",
-            self.quantizers.len(),
-            codes.len()
+            self.quantizers.len()
         );
         let n = codes[0].len();
         let d = self.config.quant_dim;

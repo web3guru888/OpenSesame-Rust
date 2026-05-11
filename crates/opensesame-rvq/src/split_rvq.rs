@@ -186,4 +186,33 @@ impl SplitRVQ {
     pub fn freeze_semantic(&mut self) {
         self.semantic_frozen = true;
     }
+
+    /// Return the currently active number of codebooks (1 semantic + N acoustic).
+    pub fn num_codebooks(&self) -> usize {
+        1 + self.acoustic_rvq.active_quantizers
+    }
+
+    /// Return the total number of trained codebooks (active + inactive).
+    pub fn max_codebooks(&self) -> usize {
+        1 + self.acoustic_rvq.quantizers.len()
+    }
+
+    /// Set the number of active codebooks at runtime.
+    ///
+    /// Mirrors the Python `mimi.set_num_codebooks(n)` API.
+    /// CB0 (semantic) is always active; `n - 1` acoustic codebooks are enabled.
+    ///
+    /// # Panics
+    /// Panics if `n < 1` or if `n - 1` exceeds the number of trained acoustic
+    /// quantizers.
+    pub fn set_num_codebooks(&mut self, n: usize) {
+        assert!(n >= 1, "set_num_codebooks: need at least 1 (semantic CB0)");
+        let n_acoustic = n - 1;
+        assert!(
+            n_acoustic <= self.acoustic_rvq.quantizers.len(),
+            "set_num_codebooks: requested {n} total but only {} trained",
+            1 + self.acoustic_rvq.quantizers.len()
+        );
+        self.acoustic_rvq.active_quantizers = n_acoustic;
+    }
 }
