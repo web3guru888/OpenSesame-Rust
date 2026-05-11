@@ -1391,6 +1391,111 @@ impl OlmoModel {
         for l in &mut self.layers { l.attn.reset_cache(); }
     }
 
+    /// Return the current sequence position (number of tokens processed so far).
+    pub fn pos(&self) -> usize { self.pos }
+
+    /// Set the sequence position explicitly (for rewind / skip-forward).
+    pub fn set_pos(&mut self, p: usize) { self.pos = p; }
+
+    /// Forward pass from a pre-computed embedding vector.
+    ///
+    /// Skips the token embedding lookup and the LM head projection — returns
+    /// the final hidden state (after all transformer layers + final RMSNorm).
+    /// Used by `opensesame-backbone` to inject multimodal (text+audio) embeddings.
+    ///
+    /// `embed`: pre-computed input vector of length `d_model`.
+    /// Returns: hidden state `[d_model]` after all layers + final RMSNorm.
+    pub fn forward_hidden_raw(&mut self, embed: Vec<f32>) -> Vec<f32> {
+        assert_eq!(embed.len(), self.config.d_model,
+            "embed len {} != d_model {}", embed.len(), self.config.d_model);
+        let pos = self.pos;
+        self.pos += 1;
+        let mut x = embed;
+        for layer in self.layers.iter_mut() {
+            layer.forward_token(&mut x, pos, &self.rope);
+        }
+        rmsnorm_inplace(&mut x, &self.norm, self.config.rms_norm_eps);
+        x
+    }
+
+    /// GPU-accelerated variant of `forward_hidden_raw`.
+    ///
+    /// Uploads the pre-computed embedding once (H2D), runs all layers with the
+    /// hidden state staying in VRAM where possible, then downloads the result.
+    /// Returns `None` if CUDA is unavailable — caller should fall back to
+    /// `forward_hidden_raw`.
+    pub fn forward_hidden_raw_gpu(&mut self, embed: Vec<f32>) -> Option<Vec<f32>> {
+        use atlas_tensor::GpuVec;
+        if !atlas_tensor::cuda_available() { return None; }
+        assert_eq!(embed.len(), self.config.d_model);
+        let pos = self.pos;
+        self.pos += 1;
+        let mut x = GpuVec::from_slice(&embed);
+        if let Some(rope_tables) = self.rope_gpu.as_ref() {
+            let rope_tables_ptr: *const atlas_tensor::GpuRopeTables = rope_tables;
+            let rope_ref = unsafe { &*rope_tables_ptr };
+            let rope_cpu_ptr: *const RopeCache = &self.rope;
+            let rope_cpu_ref = unsafe { &*rope_cpu_ptr };
+            for layer in self.layers.iter_mut() {
+                layer.forward_token_gpu_v2(&mut x, pos, rope_cpu_ref, rope_ref);
+            }
+        } else {
+            for layer in self.layers.iter_mut() {
+                layer.forward_token_gpu(&mut x, pos, &self.rope);
+            }
+        }
+        // Apply final RMSNorm on CPU (download, norm, return)
+        let mut out = x.download();
+        rmsnorm_inplace(&mut out, &self.norm, self.config.rms_norm_eps);
+        Some(out)
+    }
+
+    /// Load one layer's weights from torchtune-style named tensors.
+    ///
+    /// The torchtune naming convention (used in Sesame CSM checkpoints):
+    /// - `attn.q_proj.weight` → `layers[i].attn.wq`
+    /// - `attn.k_proj.weight` → `layers[i].attn.wk`
+    /// - `attn.v_proj.weight` → `layers[i].attn.wv`
+    /// - `attn.output_proj.weight` → `layers[i].attn.wo`
+    /// - `mlp.w1.weight` (gate) → `layers[i].ffn.w_gate`
+    /// - `mlp.w2.weight` (down) → `layers[i].ffn.w_down`
+    /// - `mlp.w3.weight` (up)   → `layers[i].ffn.w_up`
+    /// - `sa_norm.scale`        → `layers[i].attn_norm`
+    /// - `mlp_norm.scale`       → `layers[i].ffn_norm`
+    pub fn load_layer_weights_torchtune(
+        &mut self,
+        layer_i: usize,
+        q:        Vec<f32>,  // [d_model × d_model]
+        k:        Vec<f32>,  // [kv_dim × d_model]
+        v:        Vec<f32>,  // [kv_dim × d_model]
+        o:        Vec<f32>,  // [d_model × d_model]
+        gate:     Vec<f32>,  // [ffn_hidden × d_model]
+        down:     Vec<f32>,  // [d_model × ffn_hidden]
+        up:       Vec<f32>,  // [ffn_hidden × d_model]
+        attn_norm: Vec<f32>, // [d_model]
+        ffn_norm:  Vec<f32>, // [d_model]
+    ) {
+        let cfg = &self.config;
+        let head_dim = cfg.d_model / cfg.n_heads;
+        let kv_dim   = head_dim * cfg.n_kv_heads;
+        let layer = &mut self.layers[layer_i];
+        layer.attn.wq       = Linear::from_data(q,    cfg.d_model, cfg.d_model);
+        layer.attn.wk       = Linear::from_data(k,    cfg.d_model, kv_dim);
+        layer.attn.wv       = Linear::from_data(v,    cfg.d_model, kv_dim);
+        layer.attn.wo       = Linear::from_data(o,    cfg.d_model, cfg.d_model);
+        layer.ffn.w_gate    = Linear::from_data(gate, cfg.d_model, cfg.ffn_hidden);
+        layer.ffn.w_down    = Linear::from_data(down, cfg.ffn_hidden, cfg.d_model);
+        layer.ffn.w_up      = Linear::from_data(up,   cfg.d_model, cfg.ffn_hidden);
+        layer.attn_norm     = attn_norm;
+        layer.ffn_norm      = ffn_norm;
+    }
+
+    /// Load the final norm vector (sa_norm.scale / model.norm.weight).
+    pub fn load_norm_weights(&mut self, norm: Vec<f32>) {
+        assert_eq!(norm.len(), self.config.d_model);
+        self.norm = norm;
+    }
+
     /// Forward pass for one new token. Returns logits [vocab_size].
     pub fn forward_one(&mut self, token: u32) -> Vec<f32> {
         self.forward_one_hooked(token, |_layer_idx, _hidden| None)

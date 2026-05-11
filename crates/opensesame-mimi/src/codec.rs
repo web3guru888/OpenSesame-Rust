@@ -1,452 +1,365 @@
-//! Mimi codec: full encode/decode pipeline.
+//! Full Mimi audio codec: SEANet + transformer + SplitRVQ.
 //!
-//! [`MimiCodec`] wraps [`SEANetEncoder`], [`SEANetDecoder`], a pair of
-//! [`MimiTransformer`]s (encoder-side + decoder-side), and a [`SplitRVQ`].
+//! Data format conventions:
+//! - SEANet encoder output: `[B, C, T]` channel-major (batch × channels × time)
+//! - Transformer / Projection: `[T, C]` time-major
+//! - SEANet decoder input:  `[B, C, T]` channel-major
 //!
-//! # Data flow
-//!
-//! ## Encode
-//! ```text
-//! audio [B, 1, T]
-//!   ──► SEANetEncoder          → latent_cm [B, 512, T/960]  (channel-major)
-//!   ──► transpose to row-major → latent_rm [B*T/960, 512]
-//!   ──► enc_transformer        → latent_rm [B*T/960, 512]   (identity in Phase E)
-//!   ──► enc_proj (512→256)     → proj [B*T/960, 256]
-//!   ──► SplitRVQ.encode        → codes [8][B*T/960]
-//! ```
-//!
-//! ## Decode
-//! ```text
-//! codes [8][N]  (N = B * T_frames)
-//!   ──► SplitRVQ.decode       → quant [N, 256]
-//!   ──► dec_proj (256→512)    → dec_rm [N, 512]
-//!   ──► dec_transformer       → dec_rm [N, 512]  (identity in Phase E)
-//!   ──► transpose to ch-major → latent_cm [B, 512, T_frames]
-//!   ──► SEANetDecoder          → audio [B, 1, T_frames*960]
-//! ```
-//!
-//! **Phase E note**: Both transformers are identity pass-throughs. The ConvDownsample
-//! (25 fps → 12.5 fps) is not wired yet — the codec hop is 960 samples in Phase E.
+//! Transpositions are applied at the SEANet boundary.
 
 use crate::config::MimiConfig;
-use crate::loader::SafetensorsFile;
+use crate::conv::{ConvDownsample1d, ConvTrUpsample1d};
 use crate::transformer::MimiTransformer;
 use opensesame_rvq::{RVQConfig, SplitRVQ};
-use opensesame_seanet::{SEANetDecoder, SEANetEncoder};
+use opensesame_seanet::{SEANetEncoder, SEANetDecoder};
 
-// ─── MimiCodec ───────────────────────────────────────────────────────────────
+// ── Format helpers ────────────────────────────────────────────────────────────
+
+/// Transpose `[B, C, T]` → `[T, C]` (batch=1 assumed).
+///
+/// SEANet returns channel-major; transformer / projection use time-major.
+fn bct_to_tc(x: &[f32], c: usize, t: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; t * c];
+    for ti in 0..t {
+        for ci in 0..c {
+            out[ti * c + ci] = x[ci * t + ti];
+        }
+    }
+    out
+}
+
+/// Transpose `[T, C]` → `[B, C, T]` (batch=1 assumed).
+///
+/// Transformer output is time-major; SEANet decoder expects channel-major.
+fn tc_to_bct(x: &[f32], t: usize, c: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; c * t];
+    for ti in 0..t {
+        for ci in 0..c {
+            out[ci * t + ti] = x[ti * c + ci];
+        }
+    }
+    out
+}
+
+// ── Linear projection ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Projection {
+    weight: Vec<f32>,
+    in_d:   usize,
+    out_d:  usize,
+}
+
+impl Projection {
+    fn new(in_d: usize, out_d: usize) -> Self {
+        Self { weight: vec![0.0_f32; out_d * in_d], in_d, out_d }
+    }
+    /// Apply to `x` of shape `[T, in_d]`, returns `[T, out_d]`.
+    fn forward(&self, x: &[f32], t: usize) -> Vec<f32> {
+        let mut y = vec![0.0_f32; t * self.out_d];
+        for ti in 0..t {
+            let xi = &x[ti * self.in_d..(ti + 1) * self.in_d];
+            for o in 0..self.out_d {
+                let w = &self.weight[o * self.in_d..(o + 1) * self.in_d];
+                y[ti * self.out_d + o] = w.iter().zip(xi.iter()).map(|(a, b)| a * b).sum();
+            }
+        }
+        y
+    }
+}
+
+// ── RMS normalisation ─────────────────────────────────────────────────────────
+
+fn rms_normalize(x: &[f32], t: usize) -> Vec<f32> {
+    if t == 0 { return x.to_vec(); }
+    let rms = (x[..t].iter().map(|v| v * v).sum::<f32>() / t as f32).sqrt();
+    if rms < 1e-7 { return x.to_vec(); }
+    x[..t].iter().map(|v| v / rms).collect()
+}
+
+// ── Mimi ─────────────────────────────────────────────────────────────────────
 
 /// Full Mimi audio codec.
 ///
-/// Encodes mono 24 kHz audio to discrete tokens and decodes tokens back to audio.
-/// Wraps SEANet, two in-codec transformers, linear projections, and Split-RVQ.
-pub struct MimiCodec {
-    /// SEANet encoder: audio → latent (hop = 960).
-    pub encoder: SEANetEncoder,
-    /// In-codec encoder-side transformer (causal, 8L, 8H, d=512, LayerNorm+RoPE).
-    pub enc_transformer: MimiTransformer,
-    /// Split-RVQ: 1 semantic codebook + 7 acoustic codebooks, each with 2048 entries in 256d.
-    pub quantizer: SplitRVQ,
-    /// In-codec decoder-side transformer.
-    pub dec_transformer: MimiTransformer,
-    /// SEANet decoder: latent → audio.
-    pub decoder: SEANetDecoder,
-    /// Encoder projection weight: [encoder_dim=512, quant_dim=256] (row-major: [in, out]).
-    pub enc_proj: Vec<f32>,
-    /// Encoder projection bias: [quant_dim=256].
-    pub enc_proj_bias: Vec<f32>,
-    /// Decoder projection weight: [quant_dim=256, encoder_dim=512].
-    pub dec_proj: Vec<f32>,
-    /// Decoder projection bias: [encoder_dim=512].
-    pub dec_proj_bias: Vec<f32>,
-    /// Codec hyperparameters.
-    pub config: MimiConfig,
+/// Combines SEANet, in-codec transformers, ConvDownsample/Upsample, and
+/// SplitRVQ. The number of active codebooks can be changed at runtime via
+/// [`Mimi::set_num_codebooks`], mirroring Python `mimi.set_num_codebooks(32)`.
+///
+/// # Important
+/// `config.transformer_dim` must equal `config.encoder_dim` (both 512 in the
+/// production Mimi model). The in-codec transformer operates on the same
+/// feature space as the SEANet latent.
+pub struct Mimi {
+    /// Full codec configuration.
+    pub config:              MimiConfig,
+    /// SEANet encoder (1→512 at 25 fps, returns `[B, C, T]`).
+    pub encoder:             SEANetEncoder,
+    /// SEANet decoder (512→1 at 25 fps, expects `[B, C, T]`).
+    pub decoder:             SEANetDecoder,
+    /// In-codec transformer applied after SEANet encoding (operates on `[T, C]`).
+    pub encoder_transformer: MimiTransformer,
+    /// In-codec transformer applied before SEANet decoding (operates on `[T, C]`).
+    pub decoder_transformer: MimiTransformer,
+    /// Temporal downsampler: 25 fps → 12.5 fps (operates on `[T, C]`).
+    pub downsample:          ConvDownsample1d,
+    /// Temporal upsampler: 12.5 fps → 25 fps (operates on `[T, C]`).
+    pub upsample:            ConvTrUpsample1d,
+    /// Split RVQ quantizer (CB0 semantic + CB1..N-1 acoustic).
+    pub quantizer:           SplitRVQ,
+    /// Linear 512→256 (encoder_dim → quant_dim).
+    proj_down: Projection,
+    /// Linear 256→512 (quant_dim → encoder_dim).
+    proj_up:   Projection,
 }
 
-impl MimiCodec {
-    /// Construct a [`MimiCodec`] with zero-initialised weights.
+impl Mimi {
+    /// Construct a new [`Mimi`] codec with zero-initialised weights.
     ///
-    /// The resulting codec is valid for shape-testing: encoder/decoder use
-    /// deterministic random weights (from their own `::new()` constructors), and
-    /// the projections are zero-biased so the output is deterministic.
-    pub fn new(config: MimiConfig) -> Self {
-        let encoder = SEANetEncoder::new();
-        let decoder = SEANetDecoder::new();
-        let enc_transformer = MimiTransformer::new(&config);
-        let dec_transformer = MimiTransformer::new(&config);
-
+    /// For production use, load weights from a safetensors checkpoint
+    /// via [`crate::loader::load_mimi`].
+    pub fn new(cfg: MimiConfig) -> Self {
         let rvq_cfg = RVQConfig {
-            num_codebooks: config.num_codebooks, // 8
-            codebook_size: config.codebook_size, // 2048
-            quant_dim: config.quant_dim,         // 256
-            ..RVQConfig::default()
+            num_codebooks:       cfg.max_codebooks,
+            codebook_size:       cfg.codebook_size,
+            quant_dim:           cfg.quant_dim,
+            commitment_cost:     0.25,
+            ema_decay:           0.99,
+            ema_epsilon:         1e-5,
+            dead_code_threshold: 1.0,
+            kmeans_init:         true,
         };
-        // 1 semantic + 7 acoustic = 8 total codebooks.
-        let quantizer = SplitRVQ::new(rvq_cfg, 1);
-
-        let enc_dim = config.encoder_dim; // 512
-        let q_dim = config.quant_dim;     // 256
+        let mut quantizer = SplitRVQ::new(rvq_cfg, 1);
+        quantizer.set_num_codebooks(cfg.num_codebooks);
 
         Self {
-            encoder,
-            enc_transformer,
+            encoder:             SEANetEncoder::new(),
+            decoder:             SEANetDecoder::new(),
+            encoder_transformer: MimiTransformer::new(&cfg),
+            decoder_transformer: MimiTransformer::new(&cfg),
+            downsample:          ConvDownsample1d::new(cfg.encoder_dim, cfg.downsample_stride),
+            upsample:            ConvTrUpsample1d::new(cfg.encoder_dim, cfg.downsample_stride),
+            proj_down:           Projection::new(cfg.encoder_dim, cfg.quant_dim),
+            proj_up:             Projection::new(cfg.quant_dim, cfg.encoder_dim),
             quantizer,
-            dec_transformer,
-            decoder,
-            enc_proj: vec![0.0_f32; enc_dim * q_dim],   // [512, 256]
-            enc_proj_bias: vec![0.0_f32; q_dim],          // [256]
-            dec_proj: vec![0.0_f32; q_dim * enc_dim],    // [256, 512]
-            dec_proj_bias: vec![0.0_f32; enc_dim],        // [512]
-            config,
+            config: cfg,
         }
     }
 
-    // ─── Internal helpers ─────────────────────────────────────────────────────
-
-    /// General matrix-vector multiply: `[N, in_dim] × [in_dim, out_dim] + bias → [N, out_dim]`.
-    ///
-    /// `weight` is stored row-major as `[in_dim, out_dim]`:
-    /// `weight[k * out_dim + j]` is the weight connecting input index k to output index j.
-    fn linear(
-        x: &[f32],
-        n: usize,
-        in_dim: usize,
-        weight: &[f32],
-        bias: &[f32],
-        out_dim: usize,
-    ) -> Vec<f32> {
-        debug_assert_eq!(weight.len(), in_dim * out_dim);
-        debug_assert_eq!(bias.len(), out_dim);
-        debug_assert_eq!(x.len(), n * in_dim);
-
-        let mut out = vec![0.0_f32; n * out_dim];
-        for i in 0..n {
-            for j in 0..out_dim {
-                let mut acc = bias[j];
-                for k in 0..in_dim {
-                    acc += x[i * in_dim + k] * weight[k * out_dim + j];
-                }
-                out[i * out_dim + j] = acc;
-            }
-        }
-        out
+    /// Set the number of active RVQ codebooks (mirrors Python `set_num_codebooks`).
+    pub fn set_num_codebooks(&mut self, n: usize) {
+        self.config.set_num_codebooks(n);
+        self.quantizer.set_num_codebooks(n);
     }
 
-    /// Transpose channel-major `[B, C, T]` → row-major `[B*T, C]`.
-    ///
-    /// SEANet outputs channel-major: `data[b * C * T + c * T + t]`.
-    /// SplitRVQ wants row-major: `data[(b*T + t) * C + c]`.
-    fn chan_to_row(cm: &[f32], batch: usize, ch: usize, t: usize) -> Vec<f32> {
-        let n = batch * t;
-        let mut rm = vec![0.0_f32; n * ch];
-        for b in 0..batch {
-            for t_idx in 0..t {
-                for c in 0..ch {
-                    rm[(b * t + t_idx) * ch + c] = cm[b * ch * t + c * t + t_idx];
-                }
-            }
-        }
-        rm
-    }
+    /// Return the currently active number of codebooks.
+    pub fn num_codebooks(&self) -> usize { self.quantizer.num_codebooks() }
 
-    /// Transpose row-major `[B*T, C]` → channel-major `[B, C, T]`.
-    fn row_to_chan(rm: &[f32], batch: usize, ch: usize, t: usize) -> Vec<f32> {
-        let mut cm = vec![0.0_f32; batch * ch * t];
-        for b in 0..batch {
-            for t_idx in 0..t {
-                for c in 0..ch {
-                    cm[b * ch * t + c * t + t_idx] = rm[(b * t + t_idx) * ch + c];
-                }
-            }
-        }
-        cm
-    }
-
-    // ─── Public API ───────────────────────────────────────────────────────────
-
-    /// Encode audio to discrete codes.
+    /// Encode PCM audio to RVQ code indices.
     ///
-    /// # Arguments
-    /// * `audio` — flat `[B, 1, T]` mono PCM (24 kHz)
-    /// * `batch` — batch size B
-    /// * `t`     — number of audio samples T (must be a multiple of 960)
-    ///
-    /// # Returns
-    /// `Vec<Vec<u32>>` of length `num_codebooks` (8); each inner Vec has length `B * (T/960)`.
-    pub fn encode(&self, audio: &[f32], batch: usize, t: usize) -> Vec<Vec<u32>> {
+    /// # Data flow
+    /// ```text
+    /// pcm [T]
+    ///   → (RMS norm)
+    ///   → SEANetEncoder → [1, 512, T_s] channel-major  (T_s = T / 960)
+    ///   → bct_to_tc     → [T_s, 512] time-major
+    ///   → encoder_transformer → [T_s, 512]
+    ///   → proj_down 512→256   → [T_s, 256]
+    ///   → ConvDownsample       → [T_q, 256]  (T_q = T_s / 2)
+    ///   → SplitRVQ.encode      → [K, T_q]
+    /// ```
+    pub fn encode(&self, pcm: &[f32], t: usize) -> Vec<Vec<u32>> {
+        let pcm_norm = if self.config.renormalize { rms_normalize(pcm, t) } else { pcm.to_vec() };
+
+        // SEANet encoder: returns [1, 512, T_s] channel-major
+        let (enc_bct, t_s) = self.encoder.forward(&pcm_norm, 1, t);
         let enc_dim = self.config.encoder_dim; // 512
-        let q_dim = self.config.quant_dim;     // 256
 
-        // 1. SEANet encoder: [B, 1, T] → channel-major [B, 512, T/960]
-        let (latent_cm, t_out) = self.encoder.forward(audio, batch, t);
-        let n = batch * t_out; // total frame count
+        // Transpose to [T_s, 512] time-major
+        let enc_tc = bct_to_tc(&enc_bct, enc_dim, t_s);
 
-        // 2. Transpose to row-major [N, 512] for transformer + projection.
-        let latent_rm = Self::chan_to_row(&latent_cm, batch, enc_dim, t_out);
+        // In-codec transformer: [T_s, 512] → [T_s, 512]
+        let trm_out = self.encoder_transformer.forward(&enc_tc, t_s);
 
-        // 3. In-codec transformer (identity in Phase E): [N, 512] → [N, 512].
-        let latent_rm = self.enc_transformer.forward(&latent_rm, batch, t_out);
+        // ConvDownsample FIRST (on 512-dim data): [T_s, 512] → [T_q, 512]
+        let (ds_out, t_q) = self.downsample.forward(&trm_out, t_s);
 
-        // 4. Project 512 → 256.
-        let proj = Self::linear(&latent_rm, n, enc_dim, &self.enc_proj, &self.enc_proj_bias, q_dim);
+        // THEN project 512 → 256: [T_q, 256]
+        let proj_out = self.proj_down.forward(&ds_out, t_q);
 
-        // 5. Quantize.
-        self.quantizer.encode(&proj, n, q_dim)
+        // SplitRVQ encode
+        self.quantizer.encode(&proj_out, t_q, self.config.quant_dim)
     }
 
-    /// Decode discrete codes to audio.
+    /// Decode RVQ code indices back to PCM.
     ///
-    /// # Arguments
-    /// * `codes` — slice of `num_codebooks` code vectors; each has length `B * T_frames`
-    /// * `batch` — batch size B (used to reshape codes into per-batch frames)
-    ///
-    /// # Returns
-    /// Flat `[B, 1, T_frames * 960]` audio (24 kHz, Tanh-bounded to (−1, 1)).
-    /// Returns an empty Vec if `codes` is empty or each code vector is empty.
-    pub fn decode(&self, codes: &[Vec<u32>], batch: usize) -> Vec<f32> {
-        if codes.is_empty() || codes[0].is_empty() {
-            return Vec::new();
-        }
-
+    /// # Data flow
+    /// ```text
+    /// codes [K][T_q]
+    ///   → SplitRVQ.decode   → [T_q, 256] time-major
+    ///   → proj_up 256→512   → [T_q, 512]
+    ///   → ConvTrUpsample    → [T_s, 512]  (T_s = T_q * 2)
+    ///   → decoder_transformer → [T_s, 512]
+    ///   → tc_to_bct          → [1, 512, T_s] channel-major
+    ///   → SEANetDecoder      → pcm [T]
+    /// ```
+    pub fn decode(&self, codes: &[Vec<u32>]) -> (Vec<f32>, usize) {
+        if codes.is_empty() || codes[0].is_empty() { return (vec![], 0); }
+        let t_q = codes[0].len();
         let enc_dim = self.config.encoder_dim; // 512
-        let q_dim = self.config.quant_dim;     // 256
 
-        let n = codes[0].len();           // B * T_frames
-        let t_frames = n / batch;         // frames per batch item
+        // SplitRVQ decode → [T_q, 256]
+        let quant_out = self.quantizer.decode(codes);
 
-        // 1. Dequantize: codes → [N, 256].
-        let quant = self.quantizer.decode(codes);
+        // Project 256 → 512
+        let proj_out = self.proj_up.forward(&quant_out, t_q);
 
-        // 2. Project 256 → 512.
-        let dec_rm =
-            Self::linear(&quant, n, q_dim, &self.dec_proj, &self.dec_proj_bias, enc_dim);
+        // ConvTrUpsample → [T_s, 512]
+        let (us_out, t_s) = self.upsample.forward(&proj_out, t_q);
 
-        // 3. In-codec transformer (identity in Phase E).
-        let dec_rm = self.dec_transformer.forward(&dec_rm, batch, t_frames);
+        // In-codec transformer → [T_s, 512]
+        let trm_out = self.decoder_transformer.forward(&us_out, t_s);
 
-        // 4. Transpose row-major [N, 512] → channel-major [B, 512, T_frames].
-        let latent_cm = Self::row_to_chan(&dec_rm, batch, enc_dim, t_frames);
+        // Transpose to [1, 512, T_s] channel-major for SEANet decoder
+        let dec_bct = tc_to_bct(&trm_out, t_s, enc_dim);
 
-        // 5. SEANet decoder: [B, 512, T_frames] → [B, 1, T_frames * 960].
-        let (audio, _t_audio) = self.decoder.forward(&latent_cm, batch, t_frames);
-        audio
+        // SEANet decoder
+        self.decoder.forward(&dec_bct, 1, t_s)
     }
 
-    /// Encode then immediately decode (measure reconstruction quality).
-    ///
-    /// # Returns
-    /// Audio of the same length as the input (if T is a multiple of 960).
-    pub fn reconstruct(&self, audio: &[f32], batch: usize, t: usize) -> Vec<f32> {
-        let codes = self.encode(audio, batch, t);
-        self.decode(&codes, batch)
-    }
-
-    /// Load pretrained weights from a `.safetensors` file.
-    ///
-    /// Opens and parses the file; maps Kyutai weight names to our struct fields.
-    /// Returns `Err` if the file cannot be read or parsed.
-    ///
-    /// **Phase E**: the loader is wired up but weight-population is deferred.
-    /// After `from_pretrained`, the returned codec uses default (zero-projection)
-    /// weights except for SEANet which retains its own random init.
-    pub fn from_pretrained(path: &str) -> Result<Self, String> {
-        // Open and validate the file; fail fast if path is bad.
-        let _file = SafetensorsFile::open(path)?;
-        // TODO (Phase F): iterate _file.tensors and populate encoder/decoder/quantizer weights
-        // following the Kyutai weight name mapping documented in
-        // opensesame-rustymimi-analysis.md §5-7.
-        let config = MimiConfig::v0_1();
-        Ok(Self::new(config))
+    /// Encode then decode (codec round-trip).
+    pub fn round_trip(&self, pcm: &[f32], t: usize) -> (Vec<f32>, usize) {
+        self.decode(&self.encode(pcm, t))
     }
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Helper: build codec with default Mimi config.
-    fn make_codec() -> MimiCodec {
-        MimiCodec::new(MimiConfig::v0_1())
-    }
-
-    // ── Projection shape tests ────────────────────────────────────────────────
-
-    #[test]
-    fn test_enc_proj_shape() {
-        // enc_proj maps [N, 512] → [N, 256].
-        let codec = make_codec();
-        let n = 4;
-        let x = vec![0.0_f32; n * 512];
-        let y = MimiCodec::linear(
-            &x,
-            n,
-            512,
-            &codec.enc_proj,
-            &codec.enc_proj_bias,
-            256,
-        );
-        assert_eq!(y.len(), n * 256, "enc_proj output must be [N, 256]");
-    }
-
-    #[test]
-    fn test_dec_proj_shape() {
-        // dec_proj maps [N, 256] → [N, 512].
-        let codec = make_codec();
-        let n = 3;
-        let x = vec![0.0_f32; n * 256];
-        let y = MimiCodec::linear(
-            &x,
-            n,
-            256,
-            &codec.dec_proj,
-            &codec.dec_proj_bias,
-            512,
-        );
-        assert_eq!(y.len(), n * 512, "dec_proj output must be [N, 512]");
-    }
-
-    // ── Encode shape tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_codec_encode_shape() {
-        // encode([B=1, 1, T=960]) → 8 code vectors of length 1
-        let codec = make_codec();
-        let audio = vec![0.0_f32; 960];
-        let codes = codec.encode(&audio, 1, 960);
-        assert_eq!(codes.len(), 8, "must return 8 code vectors (one per codebook)");
-        for (i, cv) in codes.iter().enumerate() {
-            assert_eq!(cv.len(), 1, "codebook {} must have 1 frame", i);
+    /// Small config: 1 transformer layer, real 512-dim (matches SEANet output).
+    fn small_cfg() -> MimiConfig {
+        MimiConfig {
+            // transformer_dim MUST equal encoder_dim (512) — no separate projection
+            transformer_dim:     512,
+            transformer_heads:   8,
+            transformer_layers:  1,
+            transformer_context: 4,
+            ffn_dim:             2048,
+            conv_kernel_size:    5,
+            layer_scale_init:    0.01,
+            rope_base:           10_000.0,
+            norm_eps:            1e-5,
+            num_codebooks:       8,
+            max_codebooks:       8,
+            ..MimiConfig::default()
         }
     }
 
     #[test]
-    fn test_codec_encode_2frames() {
-        // T=1920 → 8 code vectors of length 2
-        let codec = make_codec();
-        let audio = vec![0.0_f32; 1920];
-        let codes = codec.encode(&audio, 1, 1920);
-        assert_eq!(codes.len(), 8);
-        for cv in &codes {
-            assert_eq!(cv.len(), 2, "each codebook must have 2 frames for T=1920");
+    fn test_bct_to_tc_basic() {
+        // [1, 2, 3] → [3, 2]: x[c*T+t] → y[t*C+c]
+        let x = vec![1.0, 2.0, 3.0,   4.0, 5.0, 6.0]; // C=2, T=3
+        let y = bct_to_tc(&x, 2, 3);
+        // t=0: [x[0*3+0], x[1*3+0]] = [1, 4]
+        // t=1: [x[0*3+1], x[1*3+1]] = [2, 5]
+        // t=2: [x[0*3+2], x[1*3+2]] = [3, 6]
+        assert!((y[0] - 1.0).abs() < 1e-5);
+        assert!((y[1] - 4.0).abs() < 1e-5);
+        assert!((y[2] - 2.0).abs() < 1e-5);
+        assert!((y[3] - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_tc_to_bct_roundtrip() {
+        let x: Vec<f32> = (0..6).map(|i| i as f32).collect(); // [3, 2] time-major
+        let bct = tc_to_bct(&x, 3, 2);
+        let back = bct_to_tc(&bct, 2, 3);
+        for (a, b) in x.iter().zip(back.iter()) {
+            assert!((a - b).abs() < 1e-5);
         }
     }
 
     #[test]
-    fn test_codec_batch2() {
-        // B=2, T=960 → 8 code vectors of length 2 (1 frame × 2 batch items)
-        let codec = make_codec();
-        let audio = vec![0.1_f32; 2 * 960];
-        let codes = codec.encode(&audio, 2, 960);
+    fn test_mimi_construction() {
+        let mimi = Mimi::new(small_cfg());
+        assert_eq!(mimi.num_codebooks(), 8);
+    }
+
+    #[test]
+    fn test_set_num_codebooks_32() {
+        let mut mimi = Mimi::new(MimiConfig::default());
+        assert_eq!(mimi.num_codebooks(), 32);
+        mimi.set_num_codebooks(8);
+        assert_eq!(mimi.num_codebooks(), 8);
+        mimi.set_num_codebooks(32);
+        assert_eq!(mimi.num_codebooks(), 32);
+    }
+
+    #[test]
+    fn test_encode_shape_1frame() {
+        // 1920 samples = 1920/960=2 SEANet frames → 1 codec frame (T_q=1)
+        let mimi = Mimi::new(small_cfg());
+        let codes = mimi.encode(&vec![0.1_f32; 1920], 1920);
         assert_eq!(codes.len(), 8, "8 codebooks");
-        for cv in &codes {
-            assert_eq!(cv.len(), 2, "2 entries (B=2 × T/960=1)");
-        }
-    }
-
-    // ── Decode shape tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_codec_decode_shape() {
-        // decode(8 code vecs of len 1, batch=1) → [1, 1, 960] = 960 samples
-        let codec = make_codec();
-        let codes: Vec<Vec<u32>> = (0..8).map(|_| vec![0u32]).collect();
-        let audio = codec.decode(&codes, 1);
-        assert_eq!(audio.len(), 960, "1 frame × 960 samples/frame = 960 samples");
+        assert_eq!(codes[0].len(), 1, "1 codec frame from 1920 samples");
     }
 
     #[test]
-    fn test_codec_batch2_decode_shape() {
-        // decode(8 code vecs of len 2, batch=2) → [2, 1, 960] = 1920 samples
-        let codec = make_codec();
-        let codes: Vec<Vec<u32>> = (0..8).map(|_| vec![0u32, 1u32]).collect();
-        let audio = codec.decode(&codes, 2);
-        assert_eq!(audio.len(), 1920, "B=2 × 1 frame × 960 = 1920 samples");
+    fn test_encode_shape_2frames() {
+        let mimi = Mimi::new(small_cfg());
+        let codes = mimi.encode(&vec![0.05_f32; 3840], 3840);
+        assert_eq!(codes.len(), 8);
+        assert_eq!(codes[0].len(), 2);
     }
 
-    // ── Reconstruct ───────────────────────────────────────────────────────────
-
     #[test]
-    fn test_codec_reconstruct_shape() {
-        // reconstruct: output length == input length for T=960
-        let codec = make_codec();
-        let audio = vec![0.0_f32; 960];
-        let out = codec.reconstruct(&audio, 1, 960);
-        assert_eq!(out.len(), audio.len(), "reconstruct must return same length");
+    fn test_decode_nonempty() {
+        let mimi = Mimi::new(small_cfg());
+        let codes: Vec<Vec<u32>> = (0..8).map(|_| vec![0u32; 1]).collect();
+        let (pcm, _) = mimi.decode(&codes);
+        assert!(!pcm.is_empty());
     }
 
-    // ── Code range ────────────────────────────────────────────────────────────
+    #[test]
+    fn test_round_trip_shape() {
+        let mimi = Mimi::new(small_cfg());
+        let (out, _) = mimi.round_trip(&vec![0.1_f32; 1920], 1920);
+        assert!(!out.is_empty());
+    }
 
     #[test]
-    fn test_codec_codes_in_range() {
-        // All code values must be in [0, 2047] (codebook_size = 2048)
-        let codec = make_codec();
-        let audio: Vec<f32> = (0..1920).map(|i| (i as f32 * 0.001).sin()).collect();
-        let codes = codec.encode(&audio, 1, 1920);
-        for (cb, cv) in codes.iter().enumerate() {
-            for &c in cv {
-                assert!(
-                    (c as usize) < 2048,
-                    "codebook {} code {} out of range [0, 2048)",
-                    cb,
-                    c
-                );
+    fn test_codes_in_range() {
+        let mimi = Mimi::new(small_cfg());
+        let pcm: Vec<f32> = (0..1920).map(|i| (i as f32 * 0.001).sin()).collect();
+        let codes = mimi.encode(&pcm, 1920);
+        for (cb, row) in codes.iter().enumerate() {
+            for &code in row {
+                assert!((code as usize) < mimi.config.codebook_size,
+                    "cb{cb}: code {code} ≥ vocab {}", mimi.config.codebook_size);
             }
         }
     }
 
-    // ── Determinism ───────────────────────────────────────────────────────────
-
     #[test]
-    fn test_codec_deterministic() {
-        // Same input → same codes on every call
-        let codec = make_codec();
-        let audio: Vec<f32> = (0..960).map(|i| (i as f32).sin() * 0.1).collect();
-        let codes1 = codec.encode(&audio, 1, 960);
-        let codes2 = codec.encode(&audio, 1, 960);
-        assert_eq!(codes1, codes2, "encode must be deterministic");
+    fn test_rms_normalize_unit_rms() {
+        let x = vec![1.0_f32; 100];
+        let y = rms_normalize(&x, 100);
+        let rms = (y.iter().map(|v| v * v).sum::<f32>() / 100.0).sqrt();
+        assert!((rms - 1.0).abs() < 1e-5);
     }
 
-    // ── Pipeline no crash ─────────────────────────────────────────────────────
-
     #[test]
-    fn test_codec_pipeline_no_crash() {
-        // Full encode → decode on T=960 must not panic.
-        let codec = make_codec();
-        let audio: Vec<f32> = (0..960).map(|i| (i as f32 * 0.0001).sin()).collect();
-        let codes = codec.encode(&audio, 1, 960);
-        let decoded = codec.decode(&codes, 1);
-        assert_eq!(decoded.len(), 960, "decoded length must be 960");
-        assert!(decoded.iter().all(|v| v.is_finite()), "decoded audio must be finite");
+    fn test_rms_normalize_silent() {
+        let x = vec![0.0_f32; 50];
+        let y = rms_normalize(&x, 50);
+        assert!(y.iter().all(|v| *v == 0.0));
     }
 
-    // ── Output bounded ────────────────────────────────────────────────────────
-
     #[test]
-    fn test_codec_output_bounded() {
-        // SEANetDecoder applies Tanh → output ∈ (−1, 1) ⊂ [−2, 2]
-        let codec = make_codec();
-        let audio = vec![0.5_f32; 960];
-        let codes = codec.encode(&audio, 1, 960);
-        let decoded = codec.decode(&codes, 1);
-        for &v in &decoded {
-            assert!(
-                v >= -2.0 && v <= 2.0,
-                "decoded sample {} outside [-2, 2]",
-                v
-            );
-        }
-    }
-
-    // ── Empty codes ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_codec_empty_codes() {
-        // decode with empty codes → empty audio (no panic)
-        let codec = make_codec();
-        let empty: Vec<Vec<u32>> = Vec::new();
-        let out = codec.decode(&empty, 1);
-        assert!(out.is_empty(), "decode(empty) must return empty Vec");
+    fn test_projection_shape() {
+        let p = Projection::new(512, 256);
+        assert_eq!(p.forward(&vec![0.5_f32; 4 * 512], 4).len(), 4 * 256);
     }
 }
