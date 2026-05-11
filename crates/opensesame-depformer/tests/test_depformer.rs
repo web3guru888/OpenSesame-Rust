@@ -119,12 +119,12 @@ fn different_backbone_hidden_different_codes() {
         "different backbone hiddens should produce different codes with random weights");
 }
 
-/// TEST 17: KV cache capacity (max_seq_len) equals n_codebooks.
+/// TEST 17: KV cache capacity (max_seq_len) equals n_codebooks = 32.
 #[test]
 fn depformer_kv_cache_capacity() {
     let cfg = DepformerConfig::opensesame_1b();
     let mc = cfg.to_model_config();
-    assert_eq!(mc.max_seq_len, 8, "KV cache should hold exactly n_codebooks=8 positions");
+    assert_eq!(mc.max_seq_len, 32, "KV cache should hold exactly n_codebooks=32 positions");
 }
 
 /// TEST 18: after one full frame, the position counter equals n_codebooks.

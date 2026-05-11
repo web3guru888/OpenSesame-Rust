@@ -1,18 +1,18 @@
-//! Per-codebook audio output heads for the Depformer (CB1..CB7).
+//! Per-codebook audio output heads for the Depformer (CB1..CB31).
 //!
 //! Each depth step in the Depformer produces a hidden state vector that is
-//! projected to logits over the 2048-token audio vocabulary via a dedicated
+//! projected to logits over the 2051-token audio vocabulary via a dedicated
 //! linear head.  The heads are stored as a flat weight tensor and indexed by
-//! depth (1-indexed: depth 1 → CB1 head, …, depth 7 → CB7 head).
+//! depth (1-indexed: depth 1 → CB1 head, …, depth 31 → CB31 head).
 
 /// Per-depth output projection: one `Linear(d_model → vocab_size)` per
-/// generated codebook (CB1..CB7).
+/// generated codebook (CB1..CB31).
 ///
 /// Weight layout: `weights[i]` is `[vocab_size × d_model]` row-major for
 /// codebook `i+1` (0-indexed storage, 1-indexed access via `forward`).
 ///
 /// Corresponds to the `audio_head` parameter tensor in the Sesame CSM-1B
-/// safetensors checkpoint (shape `[31, 1024, 2048]` for the 32-CB variant).
+/// safetensors checkpoint (shape `[31, 1024, 2051]`).
 pub struct CsmAudioHead {
     /// Weight matrices, one per generated codebook (0-indexed, CB1 = index 0).
     /// `weights[i]` layout: `[vocab_size × d_model]` row-major.

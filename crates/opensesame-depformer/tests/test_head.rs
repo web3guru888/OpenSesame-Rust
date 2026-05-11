@@ -20,9 +20,9 @@ fn audio_head_weight_count() {
     let cfg = DepformerConfig::opensesame_1b();
     let flat = vec![0.0f32; cfg.n_dep_codebooks * cfg.vocab_size * cfg.d_model];
     let head = CsmAudioHead::from_flat(flat, cfg.n_dep_codebooks, cfg.d_model, cfg.vocab_size);
-    assert_eq!(head.weights.len(), 7);
+    assert_eq!(head.weights.len(), 31);  // n_dep_codebooks = 31 (CB1..CB31)
     for w in &head.weights {
-        assert_eq!(w.len(), cfg.vocab_size * cfg.d_model);
+        assert_eq!(w.len(), cfg.vocab_size * cfg.d_model);  // 2051 * 1024
     }
 }
 

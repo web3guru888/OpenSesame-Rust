@@ -60,14 +60,17 @@ fn audio_head_stride_slicing() {
     }
 }
 
-/// TEST 23: Partial load from a CSM-1B checkpoint (31 dep codebooks → take 7).
+/// TEST 23: Full load from a CSM-1B checkpoint (31 dep codebooks, vocab_size=2051).
 #[test]
-fn audio_head_partial_load_from_csm1b() {
-    let (n_csm1b, n_dep, v, d) = (31usize, 7usize, 2048usize, 1024usize);
-    let flat = vec![0.0f32; n_csm1b * v * d];
-    let head = CsmAudioHead::from_flat(flat[..n_dep * v * d].to_vec(), n_dep, d, v);
-    assert_eq!(head.n_codebooks, n_dep);
-    assert_eq!(head.weights.len(), n_dep);
+fn audio_head_full_load_from_csm1b() {
+    let cfg = DepformerConfig::opensesame_1b();
+    let (n_dep, v, d) = (cfg.n_dep_codebooks, cfg.vocab_size, cfg.d_model);
+    // Shape: [31, 2051, 1024] from the HF checkpoint
+    let flat = vec![0.0f32; n_dep * v * d];
+    let head = CsmAudioHead::from_flat(flat, n_dep, d, v);
+    assert_eq!(head.n_codebooks, 31);          // CB1..CB31
+    assert_eq!(head.weights.len(), 31);
+    assert_eq!(head.vocab_size, 2051);         // EOS=0, normal=1..2048, pad=2050
 }
 
 /// TEST 24: Torchtune SwiGLU weight naming (w1=gate, w2=down, w3=up).

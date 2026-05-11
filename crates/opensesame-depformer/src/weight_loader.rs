@@ -86,7 +86,7 @@ pub fn load_depformer_from_safetensors(
 
     // ── Audio head ────────────────────────────────────────────────────────────
     // The CSM-1B checkpoint stores all 31 dep-codebook heads in `audio_head`
-    // shape [31, vocab_size, d_model].  We slice only the first n_dep_codebooks.
+    // shape [31, 2051, 1024].  We slice the first n_dep_codebooks (= 31).
     let n_dep = config.n_dep_codebooks;
     let head_stride = config.vocab_size * config.d_model;
     let audio_head_flat = st.get_f32(DEPFORMER_AUDIO_HEAD_KEY)?;
