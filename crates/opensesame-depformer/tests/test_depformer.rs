@@ -16,6 +16,7 @@ fn tiny_cfg() -> DepformerConfig {
         vocab_size:       32,
         d_backbone:       64,
         rope_base:        10_000.0,
+        rope_scale:       1.0,   // no YaRN scaling for tiny test configs
         norm_eps:         1e-5,
     }
 }

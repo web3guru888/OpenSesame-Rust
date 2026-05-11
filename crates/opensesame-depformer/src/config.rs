@@ -3,6 +3,12 @@
 //! The Depformer is the lightweight autoregressive decoder that generates
 //! codebook tokens CB1..CB31 for each audio frame, conditioned on the
 //! backbone hidden state projected to the 1024-dimensional depformer space.
+//!
+//! # RoPE scaling
+//! The depth decoder uses **Llama-3.2-style YaRN RoPE** with:
+//! - `rope_theta = 500_000` (extended base frequency)
+//! - `scale_factor = 32` (extends context from 8192 → 262144 effective positions)
+//! - `high_freq_factor = 4`, `low_freq_factor = 1` (Llama 3.2 defaults)
 
 /// Depformer configuration: 4-layer Llama-style transformer.
 ///
@@ -14,6 +20,7 @@
 /// - `n_dep_codebooks = 31` (CB1..CB31; backbone predicts CB0)
 /// - `vocab_size = 2051` (EOS=0, normal=1..2048, pad=2050)
 /// - KV cache holds 32 positions per frame (depth-0 + 31 depth steps)
+/// - RoPE: `theta=500_000`, YaRN `scale_factor=32` (same as backbone)
 #[derive(Debug, Clone)]
 pub struct DepformerConfig {
     /// Number of transformer layers. CSM-1B default: 4.
@@ -40,6 +47,10 @@ pub struct DepformerConfig {
     pub d_backbone: usize,
     /// RoPE base frequency. CSM-1B default: 500_000.0 (Llama 3.2 extended).
     pub rope_base: f32,
+    /// YaRN RoPE scale factor (extends context length). CSM-1B default: 32.0.
+    ///
+    /// Matches `rope_scaling.factor = 32` in the Llama-3.2-100M HF config.
+    pub rope_scale: f32,
     /// RMSNorm epsilon. CSM-1B default: 1e-5.
     pub norm_eps: f32,
 }
@@ -67,6 +78,7 @@ impl DepformerConfig {
             vocab_size:       2051,   // EOS=0, normal=1..2048, pad=2050
             d_backbone:       2048,
             rope_base:        500_000.0,
+            rope_scale:       32.0,   // Llama 3.2 YaRN scale_factor
             norm_eps:         1e-5,
         }
     }
@@ -75,7 +87,22 @@ impl DepformerConfig {
     ///
     /// `max_seq_len` is set to `n_codebooks` (= 32): the KV cache holds exactly
     /// one audio frame's depth sequence (1 backbone step + 31 codebook steps).
+    ///
+    /// RoPE uses YaRN scaling (`factor=32`) to match the Llama-3.2-100M checkpoint:
+    /// `high_freq_factor=4` → `beta_fast=4`, `low_freq_factor=1` → `beta_slow=1`.
     pub fn to_model_config(&self) -> atlas_model::ModelConfig {
+        let rope_scaling = if (self.rope_scale - 1.0).abs() < 1e-6 {
+            atlas_model::RopeScaling::None
+        } else {
+            // Llama-3.2 YaRN: high_freq_factor=4, low_freq_factor=1, no attn scaling
+            atlas_model::RopeScaling::Yarn {
+                factor:       self.rope_scale,
+                orig_max_pos: 8192,
+                attn_factor:  1.0,
+                beta_fast:    4.0,
+                beta_slow:    1.0,
+            }
+        };
         atlas_model::ModelConfig {
             vocab_size:    self.vocab_size,
             d_model:       self.d_model,
@@ -88,7 +115,7 @@ impl DepformerConfig {
             rms_norm_eps:  self.norm_eps,
             layer_types:   Vec::new(),
             sliding_window: None,
-            rope_scaling:  atlas_model::RopeScaling::None,
+            rope_scaling,
             eos_token_id:  None,
         }
     }

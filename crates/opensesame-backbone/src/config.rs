@@ -118,7 +118,23 @@ impl BackboneConfig {
     }
 
     /// Convert to atlas-model `ModelConfig` for use with `OlmoModel`.
+    ///
+    /// CSM-1B backbone uses Llama-3.2 YaRN RoPE (`factor=32`, `high_freq_factor=4`,
+    /// `low_freq_factor=1`, `original_max_position_embeddings=8192`).
     pub fn to_model_config(&self) -> ModelConfig {
+        // Llama-3.2 YaRN scaling for extended context (8192 → 262144 effective).
+        // For tiny configs (rope_theta=10_000), use standard RoPE.
+        let rope_scaling = if self.rope_theta >= 100_000.0 {
+            RopeScaling::Yarn {
+                factor:       32.0,
+                orig_max_pos: 8192,
+                attn_factor:  1.0,
+                beta_fast:    4.0,
+                beta_slow:    1.0,
+            }
+        } else {
+            RopeScaling::None
+        };
         ModelConfig {
             vocab_size:   self.text_vocab_size,
             d_model:      self.d_model,
@@ -131,7 +147,7 @@ impl BackboneConfig {
             rms_norm_eps: self.norm_eps,
             layer_types:  Vec::new(),
             sliding_window: None,
-            rope_scaling: RopeScaling::None,
+            rope_scaling,
             eos_token_id: None,
         }
     }
@@ -248,7 +264,15 @@ impl CsmConfig {
     }
 
     /// atlas-model `ModelConfig` for the backbone transformer.
+    ///
+    /// Uses YaRN RoPE (`factor=32`) for production configs with
+    /// `backbone_rope_base ≥ 100_000`.
     pub fn backbone_model_config(&self) -> ModelConfig {
+        let rope_scaling = if self.backbone_rope_base >= 100_000.0 {
+            RopeScaling::Yarn { factor: 32.0, orig_max_pos: 8192, attn_factor: 1.0, beta_fast: 4.0, beta_slow: 1.0 }
+        } else {
+            RopeScaling::None
+        };
         ModelConfig {
             vocab_size:   self.text_vocab_size,
             d_model:      self.backbone_d_model,
@@ -261,13 +285,21 @@ impl CsmConfig {
             rms_norm_eps: self.backbone_norm_eps,
             layer_types:  Vec::new(),
             sliding_window: None,
-            rope_scaling: RopeScaling::None,
+            rope_scaling,
             eos_token_id: None,
         }
     }
 
     /// atlas-model `ModelConfig` for the depformer transformer.
+    ///
+    /// Uses YaRN RoPE (`factor=32`) for production configs with
+    /// `dep_rope_base ≥ 100_000`.
     pub fn depformer_model_config(&self) -> ModelConfig {
+        let rope_scaling = if self.dep_rope_base >= 100_000.0 {
+            RopeScaling::Yarn { factor: 32.0, orig_max_pos: 8192, attn_factor: 1.0, beta_fast: 4.0, beta_slow: 1.0 }
+        } else {
+            RopeScaling::None
+        };
         ModelConfig {
             vocab_size:   self.audio_vocab_size,
             d_model:      self.dep_d_model,
@@ -280,7 +312,7 @@ impl CsmConfig {
             rms_norm_eps: 1e-5,
             layer_types:  Vec::new(),
             sliding_window: None,
-            rope_scaling: RopeScaling::None,
+            rope_scaling,
             eos_token_id: None,
         }
     }
