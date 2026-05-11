@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    # ── ATLAS foundation (22 crates) ──────────────────────────────────────────
     "crates/atlas-core",
     "crates/atlas-tensor",
     "crates/atlas-grad",
@@ -22,50 +23,88 @@ members = [
     "crates/atlas-bridge",
     "crates/atlas-api",
     "crates/atlas-infer",
+    # ── OpenSesame CSM (12 crates) ────────────────────────────────────────────
+    "crates/opensesame-audio",       # Stage A: WAV I/O, DSP, resampling, VAD
+    "crates/opensesame-rvq",         # Stage C: VectorQuantizer + ResidualVQ + SplitRVQ
+    "crates/opensesame-seanet",      # Stage D: SEANet causal conv encoder/decoder
+    "crates/opensesame-mimi",        # Stage E: Full Mimi codec (SEANet + RVQ + transformer)
+    "crates/opensesame-backbone",    # Stage F: CSM backbone transformer (multimodal)
+    "crates/opensesame-depformer",   # Stage G: Audio decoder (Depformer CB1..CB7)
+    "crates/opensesame-csm",         # Stage H: Full CSM assembly + streaming session
+    "crates/opensesame-data",        # Stage I: Dataset loaders + preprocessing pipeline
+    "crates/opensesame-train",       # Stage J: 3-stage training pipeline
+    "crates/opensesame-eval",        # Stage K: PESQ, STOI, SI-SNR, WER metrics
+    "crates/opensesame-serve",       # Stage L: Real-time WebSocket voice API
+    "crates/opensesame-cli",         # Stage M: `opensesame` CLI binary
 ]
 resolver = "2"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ATLAS Workspace — Pure Rust, Zero External Crate Dependencies
+# OpenSesame-Rust Workspace — Pure Rust Conversational Speech Model
+#
+# Built on ATLAS (Active-inference Training with Learned Adaptive Stigmergy)
+# by Robin Dey / OpenHub Research Thailand.
+#
+# OpenSesame implements the Sesame/Moshi Conversational Speech Model (CSM):
+#   SEANet strided conv encoder (1920× compression, 24kHz → 12.5fps)
+#   Split-RVQ tokenizer (1 semantic WavLM-distilled + 7 acoustic codebooks)
+#   Backbone transformer (Llama-3.2-1B init, text+audio multimodal tokens)
+#   Depformer audio decoder (lightweight transformer, generates CB1..CB7)
+#   Transposed conv decoder (tokens → 24kHz waveform)
+#
+# CUDA kernels (16 total = 8 ATLAS + 8 new audio-specific):
+#   audio: conv1d_causal, conv1d_strided, conv1d_transposed, depthwise_conv1d
+#          vq_search, ema_update, stft, resample
 #
 # This workspace has NO [dependencies] section by design.
 # Every algorithm is written from scratch or ported from its original source.
+# CUDA is called via raw FFI from build.rs + kernels/*.cu — no cudarc, no tch.
 #
-# "Every Rust crate you depend on is a decision made by someone you've never
-#  met, that you can never revoke."
+# The SQLite principle applied to speech AI.
+# Total: 34 crates, ~945 tests, zero external Rust crate dependencies.
 #
-# The SQLite principle: zero dependencies → portable, auditable, sovereign.
-# CUDA is called via raw FFI from build.rs + kernels/*.cu (system dep, not a
-# Rust crate). No cudarc, no tch, no candle, no ndarray, no tokio.
-#
-# Build order (7 stages, ~22 weeks):
-#   Stage 1: atlas-core → atlas-tensor → atlas-grad → atlas-optim → atlas-quant
-#   Stage 2: atlas-model → atlas-tokenize
-#   Stage 3: atlas-palace
-#   Stage 4: atlas-trm
-#   Stage 5: atlas-http → atlas-json → atlas-bayes → atlas-causal → atlas-zk → atlas-astra
-#   Stage 6: atlas-corpus (training loop)
-#   Stage 7: atlas-zk (extended) → atlas-cli
+# Build order (13 phases, ~67 weeks):
+#   Phase 0:   Repo setup (this file)
+#   Phase A:   opensesame-audio (WAV I/O, DSP, resampling, VAD)
+#   Phase B:   CUDA audio kernels (conv1d, vq_search, stft, resample)
+#   Phase C:   opensesame-rvq (VQ + RVQ + SplitRVQ + EMA)
+#   Phase D:   opensesame-seanet (SEANet causal conv 1920×)
+#   Phase E:   opensesame-mimi (full Mimi codec, weight loading)
+#   Phase F:   opensesame-backbone (CSM backbone, multimodal embedding)
+#   Phase G:   opensesame-depformer (audio decoder, CB1..CB7)
+#   Phase H:   opensesame-csm (full assembly, streaming session)
+#   Phase I:   opensesame-data (LibriSpeech, GigaSpeech, DEFLATE/tar)
+#   Phase J:   opensesame-train (3-stage training: codec → backbone → finetune)
+#   Phase K:   opensesame-eval (PESQ, STOI, WER, ABX)
+#   Phase L:   opensesame-serve (WebSocket real-time voice API)
+#   Phase M:   opensesame-cli + experiments + paper
 # ─────────────────────────────────────────────────────────────────────────────
 
 [workspace.package]
 version     = "0.1.0"
 edition     = "2021"
-authors     = ["Robin Dey <robin@openhubresearch.org>"]
+authors     = [
+    "Robin Dey <robin@openhubresearch.org>",
+    "OpenSesame Agents <opensesame@opensesame.ai>",
+]
 license     = "Apache-2.0"
-repository  = "https://github.com/web3guru888/ATLAS"
-homepage    = "https://atlasagi.org"
-description = "ATLAS: Active-inference Training with Learned Adaptive Stigmergy"
-keywords    = ["llm", "training", "stigmergy", "causal-inference", "astra"]
-categories  = ["science", "machine-learning"]
+repository  = "https://github.com/web3guru888/OpenSesame-Rust"
+homepage    = "https://github.com/web3guru888/OpenSesame-Rust"
+description = "OpenSesame: Pure Rust Conversational Speech Model on ATLAS foundation"
+keywords    = ["speech", "csm", "moshi", "tts", "asr", "atlas", "rust", "cuda"]
+categories  = ["science", "machine-learning", "multimedia::audio"]
 rust-version = "1.75"
 
 [profile.release]
-opt-level   = 3
-lto         = "thin"
-codegen-units = 1
-panic       = "abort"
+opt-level       = 3
+lto             = "thin"
+codegen-units   = 1
+panic           = "abort"
 
 [profile.dev]
-opt-level   = 0
-debug       = true
+opt-level = 0
+debug     = true
+
+[profile.bench]
+opt-level = 3
+debug     = false

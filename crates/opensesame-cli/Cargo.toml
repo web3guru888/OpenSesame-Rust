@@ -1,0 +1,22 @@
+[package]
+name        = "opensesame-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI binary: opensesame download/tokenize/train/eval/infer/serve/bench"
+
+[dependencies]
+atlas-core       = { path = "../atlas-core" }
+atlas-cli        = { path = "../atlas-cli" }
+atlas-json       = { path = "../atlas-json" }
+opensesame-csm   = { path = "../opensesame-csm" }
+opensesame-data  = { path = "../opensesame-data" }
+opensesame-train = { path = "../opensesame-train" }
+opensesame-eval  = { path = "../opensesame-eval" }
+opensesame-serve = { path = "../opensesame-serve" }
+
+[[bin]]
+name = "opensesame"
+path = "src/main.rs"

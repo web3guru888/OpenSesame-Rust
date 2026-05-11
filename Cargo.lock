@@ -197,3 +197,148 @@ version = "0.1.0"
 dependencies = [
  "atlas-core",
 ]
+
+[[package]]
+name = "opensesame-audio"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+]
+
+[[package]]
+name = "opensesame-backbone"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-grad",
+ "atlas-model",
+ "atlas-tensor",
+ "atlas-tokenize",
+ "opensesame-audio",
+]
+
+[[package]]
+name = "opensesame-cli"
+version = "0.1.0"
+dependencies = [
+ "atlas-cli",
+ "atlas-core",
+ "atlas-json",
+ "opensesame-csm",
+ "opensesame-data",
+ "opensesame-eval",
+ "opensesame-serve",
+ "opensesame-train",
+]
+
+[[package]]
+name = "opensesame-csm"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-grad",
+ "atlas-infer",
+ "atlas-model",
+ "atlas-tensor",
+ "atlas-tokenize",
+ "opensesame-audio",
+ "opensesame-backbone",
+ "opensesame-depformer",
+ "opensesame-mimi",
+]
+
+[[package]]
+name = "opensesame-data"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-http",
+ "atlas-json",
+ "atlas-tensor",
+ "atlas-tokenize",
+ "opensesame-audio",
+ "opensesame-mimi",
+]
+
+[[package]]
+name = "opensesame-depformer"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-grad",
+ "atlas-model",
+ "atlas-tensor",
+ "opensesame-backbone",
+]
+
+[[package]]
+name = "opensesame-eval"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-tensor",
+ "atlas-tokenize",
+ "opensesame-audio",
+ "opensesame-backbone",
+ "opensesame-csm",
+ "opensesame-mimi",
+]
+
+[[package]]
+name = "opensesame-mimi"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-grad",
+ "atlas-json",
+ "atlas-model",
+ "atlas-tensor",
+ "opensesame-audio",
+ "opensesame-rvq",
+ "opensesame-seanet",
+]
+
+[[package]]
+name = "opensesame-rvq"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-grad",
+ "atlas-tensor",
+ "opensesame-audio",
+]
+
+[[package]]
+name = "opensesame-seanet"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-grad",
+ "atlas-tensor",
+ "opensesame-audio",
+]
+
+[[package]]
+name = "opensesame-serve"
+version = "0.1.0"
+dependencies = [
+ "atlas-api",
+ "atlas-core",
+ "atlas-http",
+ "opensesame-audio",
+ "opensesame-csm",
+ "opensesame-eval",
+]
+
+[[package]]
+name = "opensesame-train"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-corpus",
+ "atlas-grad",
+ "atlas-optim",
+ "atlas-tensor",
+ "opensesame-csm",
+ "opensesame-data",
+]

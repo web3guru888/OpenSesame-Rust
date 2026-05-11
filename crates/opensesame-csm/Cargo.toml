@@ -1,0 +1,20 @@
+[package]
+name        = "opensesame-csm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Full CSM assembly: Mimi + Backbone + Depformer + streaming session"
+
+[dependencies]
+atlas-core      = { path = "../atlas-core" }
+atlas-tensor    = { path = "../atlas-tensor" }
+atlas-grad      = { path = "../atlas-grad" }
+atlas-model     = { path = "../atlas-model" }
+atlas-infer     = { path = "../atlas-infer" }
+atlas-tokenize  = { path = "../atlas-tokenize" }
+opensesame-audio      = { path = "../opensesame-audio" }
+opensesame-mimi       = { path = "../opensesame-mimi" }
+opensesame-backbone   = { path = "../opensesame-backbone" }
+opensesame-depformer  = { path = "../opensesame-depformer" }

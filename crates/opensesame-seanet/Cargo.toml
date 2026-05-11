@@ -1,0 +1,14 @@
+[package]
+name        = "opensesame-seanet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SEANet causal strided conv encoder/decoder — 1920x temporal compression"
+
+[dependencies]
+atlas-core   = { path = "../atlas-core" }
+atlas-tensor = { path = "../atlas-tensor" }
+atlas-grad   = { path = "../atlas-grad" }
+opensesame-audio = { path = "../opensesame-audio" }

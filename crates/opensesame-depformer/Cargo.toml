@@ -1,0 +1,15 @@
+[package]
+name        = "opensesame-depformer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Depformer audio decoder: lightweight transformer generating codebooks CB1..CB7"
+
+[dependencies]
+atlas-core    = { path = "../atlas-core" }
+atlas-tensor  = { path = "../atlas-tensor" }
+atlas-grad    = { path = "../atlas-grad" }
+atlas-model   = { path = "../atlas-model" }
+opensesame-backbone = { path = "../opensesame-backbone" }

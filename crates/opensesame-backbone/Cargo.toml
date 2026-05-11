@@ -1,0 +1,16 @@
+[package]
+name        = "opensesame-backbone"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CSM backbone transformer: multimodal text+audio embeddings, Inner Monologue"
+
+[dependencies]
+atlas-core     = { path = "../atlas-core" }
+atlas-tensor   = { path = "../atlas-tensor" }
+atlas-grad     = { path = "../atlas-grad" }
+atlas-model    = { path = "../atlas-model" }
+atlas-tokenize = { path = "../atlas-tokenize" }
+opensesame-audio = { path = "../opensesame-audio" }

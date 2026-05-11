@@ -1,9 +1,15 @@
-//! build.rs — Compile CUDA kernels if nvcc is available.
+//! build.rs — Compile ALL CUDA kernels (ATLAS + OpenSesame audio) if nvcc is available.
 //!
 //! Zero-dependency GPU strategy:
-//!   - `nvcc kernels/matmul.cu` → compiled into the build output
+//!   - `nvcc kernels/*.cu` → compiled into a single static lib
 //!   - Link against system `libcuda` and `libcublas` (system libs, not Rust crates)
 //!   - Rust calls via `extern "C"` — no cudarc, no tch, no candle
+//!
+//! Kernels compiled (16 total):
+//!   ATLAS (8):       matmul, attention, quant,
+//!                    (rmsnorm, rope, silu_mul, adamw, argmax — in attention.cu / matmul.cu)
+//!   OpenSesame (8):  conv1d_causal, conv1d_strided, conv1d_transposed, depthwise_conv1d,
+//!                    vq_search, ema_update, stft, resample
 //!
 //! GPU architecture auto-detection order:
 //!   1. ATLAS_CUDA_ARCH env var (e.g. "sm_75")
@@ -16,21 +22,38 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// All .cu kernel files to compile (relative to workspace root kernels/).
+const ATLAS_KERNELS: &[&str] = &[
+    "matmul.cu",
+    "attention.cu",
+    "quant.cu",
+];
+
+const OPENSESAME_KERNELS: &[&str] = &[
+    "conv1d_causal.cu",
+    "conv1d_strided.cu",
+    "conv1d_transposed.cu",
+    "depthwise_conv1d.cu",
+    "vq_search.cu",
+    "ema_update.cu",
+    "stft.cu",
+    "resample.cu",
+];
+
 fn main() {
     // Declare custom cfg flags so rustc's check-cfg lint doesn't warn
     println!("cargo::rustc-check-cfg=cfg(atlas_cuda)");
     println!("cargo::rustc-check-cfg=cfg(atlas_cpu_only)");
 
-    // Emit rerun triggers
+    // Emit rerun triggers for all kernels
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ATLAS_CUDA_ARCH");
-    println!("cargo:rerun-if-changed=../../kernels/matmul.cu");
-    println!("cargo:rerun-if-changed=../../kernels/attention.cu");
-    println!("cargo:rerun-if-changed=../../kernels/quant.cu");
+    for k in ATLAS_KERNELS.iter().chain(OPENSESAME_KERNELS.iter()) {
+        println!("cargo:rerun-if-changed=../../kernels/{k}");
+    }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let kernels_dir = Path::new("../../kernels");
-    let matmul_cu = kernels_dir.join("matmul.cu");
 
     // ── 1. Locate nvcc ────────────────────────────────────────────────────────
     let nvcc = find_nvcc();
@@ -45,37 +68,59 @@ fn main() {
     let arch = gpu_arch();
     eprintln!("[atlas-tensor/build.rs] GPU arch = {arch}");
 
-    // ── 3. Compile matmul.cu ─────────────────────────────────────────────────
-    if !matmul_cu.exists() {
-        eprintln!("[atlas-tensor/build.rs] kernels/matmul.cu not found — skipping CUDA");
+    // ── 3. Compile each .cu → .o ──────────────────────────────────────────────
+    let all_kernels: Vec<&str> = ATLAS_KERNELS.iter()
+        .chain(OPENSESAME_KERNELS.iter())
+        .copied()
+        .collect();
+
+    let mut obj_files: Vec<PathBuf> = Vec::new();
+
+    for kernel_file in &all_kernels {
+        let cu_path = kernels_dir.join(kernel_file);
+        if !cu_path.exists() {
+            eprintln!("[atlas-tensor/build.rs] kernel not found: {} — skipping", cu_path.display());
+            continue;
+        }
+
+        let stem = Path::new(kernel_file).file_stem().unwrap().to_str().unwrap();
+        let obj = out_dir.join(format!("{stem}.o"));
+
+        let status = Command::new(&nvcc)
+            .args([
+                "-O3",
+                &format!("-arch={arch}"),
+                "--compiler-options", "-fPIC",
+                "-c", cu_path.to_str().unwrap(),
+                "-o", obj.to_str().unwrap(),
+            ])
+            .status()
+            .expect("nvcc invocation failed");
+
+        if !status.success() {
+            eprintln!("[atlas-tensor/build.rs] nvcc compilation FAILED for {kernel_file} — falling back to CPU");
+            println!("cargo:rustc-cfg=atlas_cpu_only");
+            return;
+        }
+        eprintln!("[atlas-tensor/build.rs] compiled {kernel_file} → {}", obj.display());
+        obj_files.push(obj);
+    }
+
+    if obj_files.is_empty() {
+        eprintln!("[atlas-tensor/build.rs] no kernel objects produced — CPU-only");
         println!("cargo:rustc-cfg=atlas_cpu_only");
         return;
     }
 
-    let obj = out_dir.join("matmul.o");
+    // ── 4. Package all .o → single static lib ────────────────────────────────
     let lib = out_dir.join("libatlas_kernels.a");
+    let obj_strs: Vec<&str> = obj_files.iter().map(|p| p.to_str().unwrap()).collect();
 
-    // Compile .cu → .o
-    let status = Command::new(&nvcc)
-        .args([
-            "-O3",
-            &format!("-arch={arch}"),
-            "--compiler-options", "-fPIC",
-            "-c", matmul_cu.to_str().unwrap(),
-            "-o", obj.to_str().unwrap(),
-        ])
-        .status()
-        .expect("nvcc invocation failed");
+    let mut ar_args = vec!["rcs", lib.to_str().unwrap()];
+    ar_args.extend_from_slice(&obj_strs);
 
-    if !status.success() {
-        eprintln!("[atlas-tensor/build.rs] nvcc compilation FAILED — falling back to CPU");
-        println!("cargo:rustc-cfg=atlas_cpu_only");
-        return;
-    }
-
-    // Package .o → static lib
     let ar_ok = Command::new("ar")
-        .args(["rcs", lib.to_str().unwrap(), obj.to_str().unwrap()])
+        .args(&ar_args)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -86,9 +131,8 @@ fn main() {
         return;
     }
 
-    // Tell cargo where to find it
+    // ── 5. Tell cargo where to find the static lib and system CUDA libs ───────
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    // Also add CUDA lib directories so the linker can find libcudart
     for dir in &[
         "/usr/local/cuda/lib64",
         "/usr/local/cuda-12.9/lib64",
@@ -102,15 +146,17 @@ fn main() {
         }
     }
     println!("cargo:rustc-link-lib=static=atlas_kernels");
-    println!("cargo:rustc-link-lib=cudart");  // CUDA runtime (malloc/free/memcpy/sync/kernels)
-    println!("cargo:rustc-link-lib=cublas");  // cuBLAS — tensor core GEMM (system lib, not a Rust crate)
+    println!("cargo:rustc-link-lib=cudart");  // CUDA runtime
+    println!("cargo:rustc-link-lib=cublas");  // cuBLAS (TF32 tensor cores)
     println!("cargo:rustc-cfg=atlas_cuda");
-    eprintln!("[atlas-tensor/build.rs] CUDA kernels compiled OK ({arch})");
+    eprintln!(
+        "[atlas-tensor/build.rs] All {} kernels compiled OK ({arch})",
+        obj_files.len()
+    );
 }
 
 /// Find nvcc: check ATLAS_CUDA_ARCH env hint path, common CUDA install dirs, then PATH.
 fn find_nvcc() -> Option<PathBuf> {
-    // Common install locations
     let candidates = [
         "/usr/local/cuda/bin/nvcc",
         "/usr/local/cuda-12.9/bin/nvcc",
@@ -139,21 +185,14 @@ fn find_nvcc() -> Option<PathBuf> {
 /// Determine the best CUDA architecture string.
 /// Priority: ATLAS_CUDA_ARCH env → nvidia-smi query → safe default (sm_75).
 fn gpu_arch() -> String {
-    // 1. Explicit env override
     if let Ok(arch) = std::env::var("ATLAS_CUDA_ARCH") {
         if !arch.is_empty() {
             return arch;
         }
     }
 
-    // 2. Ask nvidia-smi for compute capability of GPU 0
-    //    Output format: "7.5" for T4, "8.6" for RTX 3090/4090, etc.
     let smi = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=compute_cap",
-            "--format=csv,noheader",
-            "--id=0",
-        ])
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader", "--id=0"])
         .output();
 
     if let Ok(out) = smi {
@@ -166,7 +205,5 @@ fn gpu_arch() -> String {
         }
     }
 
-    // 3. Safe fallback — T4 (Turing, sm_75).
-    //    Works on T4, also compiles (with reduced perf) on newer cards.
     "sm_75".to_string()
 }

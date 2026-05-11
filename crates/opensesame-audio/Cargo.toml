@@ -1,0 +1,11 @@
+[package]
+name        = "opensesame-audio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WAV I/O, sinc resampler, ring buffer, VAD — zero external dependencies"
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }

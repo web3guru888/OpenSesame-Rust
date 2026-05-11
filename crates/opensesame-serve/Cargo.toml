@@ -1,0 +1,16 @@
+[package]
+name        = "opensesame-serve"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Real-time voice API: WebSocket RFC 6455 streaming, turn detection, 400ms latency"
+
+[dependencies]
+atlas-core   = { path = "../atlas-core" }
+atlas-http    = { path = "../atlas-http" }
+atlas-api     = { path = "../atlas-api" }
+opensesame-csm   = { path = "../opensesame-csm" }
+opensesame-audio = { path = "../opensesame-audio" }
+opensesame-eval  = { path = "../opensesame-eval" }

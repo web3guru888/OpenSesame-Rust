@@ -1,0 +1,17 @@
+[package]
+name        = "opensesame-data"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dataset pipeline: LibriSpeech/GigaSpeech loaders, DEFLATE/tar, tokenization"
+
+[dependencies]
+atlas-core     = { path = "../atlas-core" }
+atlas-tensor   = { path = "../atlas-tensor" }
+atlas-http     = { path = "../atlas-http" }
+atlas-json     = { path = "../atlas-json" }
+atlas-tokenize = { path = "../atlas-tokenize" }
+opensesame-audio = { path = "../opensesame-audio" }
+opensesame-mimi  = { path = "../opensesame-mimi" }

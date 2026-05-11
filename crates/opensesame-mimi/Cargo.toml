@@ -1,0 +1,18 @@
+[package]
+name        = "opensesame-mimi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mimi audio codec: SEANet + RVQ + in-codec transformer + safetensors loader"
+
+[dependencies]
+atlas-core    = { path = "../atlas-core" }
+atlas-tensor  = { path = "../atlas-tensor" }
+atlas-grad    = { path = "../atlas-grad" }
+atlas-model   = { path = "../atlas-model" }
+atlas-json    = { path = "../atlas-json" }
+opensesame-audio  = { path = "../opensesame-audio" }
+opensesame-rvq    = { path = "../opensesame-rvq" }
+opensesame-seanet = { path = "../opensesame-seanet" }

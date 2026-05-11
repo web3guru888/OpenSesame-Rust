@@ -1,0 +1,17 @@
+[package]
+name        = "opensesame-eval"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Evaluation: PESQ, STOI, SI-SNR, WER, codec ABX — all implemented from scratch"
+
+[dependencies]
+atlas-core    = { path = "../atlas-core" }
+atlas-tensor  = { path = "../atlas-tensor" }
+atlas-tokenize = { path = "../atlas-tokenize" }
+opensesame-audio    = { path = "../opensesame-audio" }
+opensesame-mimi     = { path = "../opensesame-mimi" }
+opensesame-backbone = { path = "../opensesame-backbone" }
+opensesame-csm      = { path = "../opensesame-csm" }
